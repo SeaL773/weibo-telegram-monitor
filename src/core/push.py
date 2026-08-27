@@ -3,8 +3,9 @@
 import re
 from src.utils.LoggerManager import logger as log
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from src.core.config import COMMENT_MONITOR_HOURS, ET
 from src.core.utils import html_escape, mid_to_base62
@@ -27,6 +28,13 @@ from src.telegram.bot import (
 from src.screenshot.browser import screenshot_post
 from src.archive.storage import archive_post, download_video, send_video, is_allowed_media_url
 
+
+
+@dataclass(frozen=True)
+class DeliveryResult:
+    primary_delivered: bool
+    message_id: Optional[int] = None
+    optional_failures: List[str] = field(default_factory=list)
 
 
 def _clean_hashtag(name: str) -> str:
@@ -66,11 +74,17 @@ def build_caption(post: Dict, uid: str) -> str:
     return "\n".join(parts)
 
 
-def push_post(post: Dict, uid: str, cookie_dict: Dict, state: Optional[Dict] = None):
-    """Process and push a new post to Telegram. Returns TG message_id or None."""
+def push_post(
+    post: Dict,
+    uid: str,
+    cookie_dict: Dict,
+    state: Optional[Dict] = None,
+) -> DeliveryResult:
+    """Deliver a post and report whether its primary notification was acknowledged."""
     mid = extract_post_id(post)
     caption = build_caption(post, uid)
     tg_message_id = None
+    optional_failures: List[str] = []
 
     # Screenshot the post
     log.info(f"Taking screenshot of post {mid}...")
@@ -82,40 +96,64 @@ def push_post(post: Dict, uid: str, cookie_dict: Dict, state: Optional[Dict] = N
         result = tg_send_photo_bytes(screenshot, caption)
         if result:
             tg_message_id = result.get("message_id")
-    else:
-        # Fallback: text only
-        log.warning(f"Screenshot failed for {mid}, sending text only")
+        else:
+            log.warning(f"Screenshot delivery failed for {mid}, sending text fallback")
+
+    if not tg_message_id:
+        if not screenshot:
+            log.warning(f"Screenshot failed for {mid}, sending text only")
         text = post.get("text_raw", "") or post.get("text", "")
         clean_text = re.sub(r'<[^>]+>', '', text)[:500]
         result = tg_send(f"{caption}\n\n{html_escape(clean_text)}")
         if result:
             tg_message_id = result.get("message_id")
 
-    # Handle images and GIFs
-    photo_urls, gif_urls = extract_image_urls(post)
-    photo_urls = [url for url in photo_urls if is_allowed_media_url(url)]
-    gif_urls = [url for url in gif_urls if is_allowed_media_url(url)]
-    if photo_urls:
-        log.info(f"Sending {len(photo_urls)} image(s) for post {mid}")
-        if len(photo_urls) == 1:
-            tg_send_photo_url(photo_urls[0])
-        else:
-            tg_send_media_group_url(photo_urls)
-    for gif_url in gif_urls:
-        log.info(f"Sending GIF for post {mid}")
-        tg_send_animation_url(gif_url)
+    if not tg_message_id:
+        try:
+            archive_post(post, uid, screenshot_bytes=screenshot, cookie_dict=cookie_dict)
+        except Exception as e:
+            log.warning(f"Archive failed for undelivered post {mid}: {type(e).__name__}")
+        return DeliveryResult(primary_delivered=False)
+
+    # Optional work must never turn an acknowledged primary notification into
+    # a retry of the whole post, which would create duplicate Telegram posts.
+    try:
+        photo_urls, gif_urls = extract_image_urls(post)
+        photo_urls = [url for url in photo_urls if is_allowed_media_url(url)]
+        gif_urls = [url for url in gif_urls if is_allowed_media_url(url)]
+        if photo_urls:
+            log.info(f"Sending {len(photo_urls)} image(s) for post {mid}")
+            if len(photo_urls) == 1:
+                if not tg_send_photo_url(photo_urls[0]):
+                    optional_failures.append("photo")
+            elif not tg_send_media_group_url(photo_urls):
+                optional_failures.append("photo_group")
+        for gif_url in gif_urls:
+            log.info(f"Sending GIF for post {mid}")
+            if not tg_send_animation_url(gif_url):
+                optional_failures.append("gif")
+    except Exception as e:
+        optional_failures.append("image_processing")
+        log.warning(f"Optional image delivery failed for {mid}: {type(e).__name__}")
 
     # Handle video
-    if has_video(post):
-        video_url = extract_video_url(post)
-        if video_url:
-            log.info(f"Downloading video for post {mid}...")
-            time.sleep(1)
-            video_path = download_video(video_url, mid, cookie_dict)
-            if video_path:
-                send_video(video_path, caption)
-        else:
-            log.warning(f"Video detected but URL not found for {mid}")
+    try:
+        if has_video(post):
+            video_url = extract_video_url(post)
+            if video_url:
+                log.info(f"Downloading video for post {mid}...")
+                time.sleep(1)
+                video_path = download_video(video_url, mid, cookie_dict)
+                if video_path:
+                    if not send_video(video_path, caption):
+                        optional_failures.append("video")
+                else:
+                    optional_failures.append("video_download")
+            else:
+                log.warning(f"Video detected but URL not found for {mid}")
+    except Exception as e:
+        optional_failures.append("video_processing")
+        log.warning(f"Optional video delivery failed for {mid}: {type(e).__name__}")
 
     # Archive locally
     try:
@@ -125,18 +163,28 @@ def push_post(post: Dict, uid: str, cookie_dict: Dict, state: Optional[Dict] = N
 
     # Register for comment monitoring
     if state is not None and tg_message_id:
-        now_ts = int(time.time())
-        state.setdefault("active_posts", {})[mid] = {
-            "uid": uid,
-            "tg_message_id": tg_message_id,
-            "edit_count": post.get("edit_count", 0),
-            "seen_comment_ids": [],
-            "last_activity": now_ts,
-            "expires_at": now_ts + COMMENT_MONITOR_HOURS * 3600,
-            "created_at": now_ts,
-            "poll_count": 0,
-        }
-        log.info(f"Registered post {mid} for comment monitoring (tg_msg={tg_message_id})")
+        try:
+            now_ts = int(time.time())
+            state.setdefault("active_posts", {})[mid] = {
+                "uid": uid,
+                "tg_message_id": tg_message_id,
+                "edit_count": post.get("edit_count", 0),
+                "seen_comment_ids": [],
+                "last_activity": now_ts,
+                "expires_at": now_ts + COMMENT_MONITOR_HOURS * 3600,
+                "created_at": now_ts,
+                "poll_count": 0,
+            }
+            log.info(
+                f"Registered post {mid} for comment monitoring (tg_msg={tg_message_id})"
+            )
+        except Exception as e:
+            optional_failures.append("comment_registration")
+            log.warning(f"Comment registration failed for {mid}: {type(e).__name__}")
 
     time.sleep(1)
-    return tg_message_id
+    return DeliveryResult(
+        primary_delivered=True,
+        message_id=tg_message_id,
+        optional_failures=optional_failures,
+    )

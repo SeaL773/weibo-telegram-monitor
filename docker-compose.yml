@@ -3,6 +3,7 @@ services:
     build: .
     container_name: weibo-telegram-monitor
     restart: unless-stopped
+    stop_grace_period: 3m
     init: true
     env_file: .env
     volumes:
@@ -10,21 +11,27 @@ services:
     environment:
       - TZ=America/New_York
       - HOME=/tmp
+      - HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-1800}
     read_only: true
     tmpfs:
-      - /tmp:size=256m,mode=1777
-    shm_size: "256m"
+      - /tmp:size=512m,mode=1777
+    shm_size: "512m"
+    mem_limit: ${MEM_LIMIT:-2g}
+    mem_reservation: ${MEM_RESERVATION:-512m}
+    cpus: "${CPU_LIMIT:-2.0}"
+    pids_limit: 256
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import os,sys,time; sys.exit(0 if os.path.exists('/tmp/healthcheck') and time.time()-os.path.getmtime('/tmp/healthcheck')<900 else 1)\""]
+      test: ["CMD", "python", "-c", "import os,sys,time; p='/tmp/healthcheck'; limit=int(os.getenv('HEALTH_TIMEOUT','1800')); sys.exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p)<limit else 1)"]
       interval: 60s
       timeout: 5s
       retries: 3
-      start_period: 120s
+      start_period: 180s
     logging:
+      driver: local
       options:
         max-size: "10m"
         max-file: "3"

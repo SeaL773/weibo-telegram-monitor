@@ -3,11 +3,26 @@
 import random
 from src.utils.LoggerManager import logger as log
 import time
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import httpx
 
-from src.api.client import _check_response
+from src.api.client import WeiboApiError, _check_response
+from src.api.posts import FetchResult
+
+
+@dataclass(frozen=True)
+class ProfileDelta:
+    snapshot: Dict
+    changes: List[str]
+
+
+@dataclass(frozen=True)
+class FollowDelta:
+    snapshot: List[Dict]
+    new_follows: List[str]
+    unfollows: List[str]
 
 
 
@@ -27,53 +42,108 @@ def get_user_info(client: httpx.Client, uid: str) -> Optional[Dict]:
     return data.get("data", {}).get("user", {})
 
 
-def get_follow_list(client: httpx.Client, uid: str) -> List[Dict]:
-    """Fetch the list of users this UID follows. Returns list of {id, screen_name}."""
+def get_follow_list(client: httpx.Client, uid: str) -> FetchResult[Dict]:
+    """Fetch follows, returning items only as a snapshot when complete."""
     url = "https://weibo.com/ajax/friendships/friends"
-    all_follows = []
+    all_follows: List[Dict] = []
     page = 1
+    pages_fetched = 0
     while page <= 20:  # Safety limit
         params = {"uid": uid, "page": page}
         try:
             r = client.get(url, params=params)
         except Exception as e:
             log.error(f"Failed to fetch follow list for {uid} page {page}: {e}")
-            break
+            return FetchResult(
+                items=all_follows,
+                complete=False,
+                pages_fetched=pages_fetched,
+                reason="request_error",
+            )
 
-        data = _check_response(r, uid, context="friendships/friends")
-        if data is None:
-            return None
+        try:
+            data = _check_response(
+                r,
+                uid,
+                context="friendships/friends",
+                raise_errors=True,
+            )
+        except WeiboApiError as exc:
+            return FetchResult(
+                items=all_follows,
+                complete=False,
+                pages_fetched=pages_fetched,
+                reason=exc.kind,
+            )
 
-        users = data.get("users", [])
+        users = data.get("users")
+        if not isinstance(users, list):
+            log.error(f"Malformed follow list for {uid} page {page}")
+            return FetchResult(
+                items=all_follows,
+                complete=False,
+                pages_fetched=pages_fetched,
+                reason="invalid_payload",
+            )
+
+        pages_fetched += 1
         if not users:
-            break
+            return FetchResult(
+                items=all_follows,
+                complete=True,
+                pages_fetched=pages_fetched,
+                reason="exhausted",
+            )
         for u in users:
+            if not isinstance(u, dict) or not str(u.get("id", "")):
+                log.error(f"Malformed follow entry for {uid} page {page}")
+                return FetchResult(
+                    items=all_follows,
+                    complete=False,
+                    pages_fetched=pages_fetched,
+                    reason="invalid_payload",
+                )
             all_follows.append({
                 "id": str(u.get("id", "")),
                 "screen_name": u.get("screen_name", ""),
             })
         if len(users) < 20:
-            break
+            return FetchResult(
+                items=all_follows,
+                complete=True,
+                pages_fetched=pages_fetched,
+                reason="exhausted",
+            )
         page += 1
-        time.sleep(random.uniform(1, 2))
-    return all_follows
+        if page <= 20:
+            time.sleep(random.uniform(1, 2))
+
+    return FetchResult(
+        items=all_follows,
+        complete=False,
+        pages_fetched=pages_fetched,
+        reason="page_limit",
+        truncated=True,
+    )
 
 
-def check_profile_changes(client: httpx.Client, uid: str, state: Dict) -> List[str]:
-    """Check for profile changes. Returns list of change descriptions."""
+def detect_profile_changes(
+    client: httpx.Client,
+    uid: str,
+    stored: Dict,
+) -> Optional[ProfileDelta]:
+    """Return an immutable profile delta without committing caller state."""
     user_info = get_user_info(client, uid)
     if not user_info:
-        return []
+        return None
 
-    stored = state.get("profiles", {}).get(uid, {})
+    snapshot = {
+        "screen_name": user_info.get("screen_name", ""),
+        "description": user_info.get("description", ""),
+        "avatar_hd": user_info.get("avatar_hd", ""),
+    }
     if not stored:
-        # First time: save and skip
-        state.setdefault("profiles", {})[uid] = {
-            "screen_name": user_info.get("screen_name", ""),
-            "description": user_info.get("description", ""),
-            "avatar_hd": user_info.get("avatar_hd", ""),
-        }
-        return []
+        return ProfileDelta(snapshot=snapshot, changes=[])
 
     changes = []
     new_name = user_info.get("screen_name", "")
@@ -91,34 +161,41 @@ def check_profile_changes(client: httpx.Client, uid: str, state: Dict) -> List[s
     if new_avatar and old_avatar and new_avatar != old_avatar:
         changes.append("头像已更换")
 
-    # Update stored profile
-    if changes:
-        state.setdefault("profiles", {})[uid] = {
-            "screen_name": new_name,
-            "description": new_desc,
-            "avatar_hd": new_avatar,
-        }
-
-    return changes
+    return ProfileDelta(snapshot=snapshot, changes=changes)
 
 
-def check_follow_changes(client: httpx.Client, uid: str, state: Dict) -> tuple:
-    """Check for follow list changes. Returns (new_follows, unfollows)."""
-    current_follows = get_follow_list(client, uid)
-    if current_follows is None:
-        log.warning(f"Follow list fetch failed for {uid}, skipping comparison")
-        return [], []
-    if not current_follows:
-        return [], []
+def check_profile_changes(client: httpx.Client, uid: str, state: Dict) -> List[str]:
+    """Compatibility wrapper that detects and commits a complete snapshot."""
+    delta = detect_profile_changes(
+        client,
+        uid,
+        state.get("profiles", {}).get(uid, {}),
+    )
+    if delta is None:
+        return []
+    state.setdefault("profiles", {})[uid] = delta.snapshot
+    return delta.changes
 
-    stored_key = f"follows_{uid}"
-    stored_follows = state.get(stored_key, [])
+def detect_follow_changes(
+    client: httpx.Client,
+    uid: str,
+    stored_follows: Optional[List[Dict]],
+) -> Optional[FollowDelta]:
+    """Return a complete follow delta without mutating caller state."""
+    result = get_follow_list(client, uid)
+    if not result.complete:
+        log.warning(
+            f"Follow list fetch incomplete for {uid} "
+            f"({result.reason}, {len(result.items)} partial items), skipping comparison"
+        )
+        return None
 
-    if not stored_follows:
-        # First time: save and skip
-        state[stored_key] = current_follows
-        log.info(f"Cached {len(current_follows)} follows for {uid}")
-        return [], []
+    current_follows = result.items
+    if stored_follows is None:
+        return FollowDelta(current_follows, [], [])
+    if not isinstance(stored_follows, list):
+        log.warning(f"Invalid stored follow snapshot for {uid}, replacing baseline")
+        return FollowDelta(current_follows, [], [])
 
     old_ids = {f["id"]: f["screen_name"] for f in stored_follows}
     new_ids = {f["id"]: f["screen_name"] for f in current_follows}
@@ -133,7 +210,17 @@ def check_follow_changes(client: httpx.Client, uid: str, state: Dict) -> tuple:
         if fid not in new_ids:
             unfollows.append(name)
 
-    if new_follows or unfollows:
-        state[stored_key] = current_follows
+    return FollowDelta(current_follows, new_follows, unfollows)
 
-    return new_follows, unfollows
+
+def check_follow_changes(client: httpx.Client, uid: str, state: Dict) -> tuple:
+    """Compatibility wrapper that detects and commits a complete snapshot."""
+    stored_key = f"follows_{uid}"
+    is_initial_snapshot = stored_key not in state
+    delta = detect_follow_changes(client, uid, state.get(stored_key))
+    if delta is None:
+        return [], []
+    state[stored_key] = delta.snapshot
+    if is_initial_snapshot:
+        log.info(f"Cached {len(delta.snapshot)} follows for {uid}")
+    return delta.new_follows, delta.unfollows

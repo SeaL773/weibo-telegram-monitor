@@ -98,6 +98,56 @@ class CookieStoreTests(unittest.TestCase):
             {"XSRF-TOKEN": "new", "SUB": "session"},
         )
 
+    def test_stale_playwright_writer_cannot_overwrite_httpx_rotation(self) -> None:
+        store = CookieStore(self.path)
+        store.bootstrap('{"SUB":"old"}')
+        context_revision, stale_context_cookies = store.snapshot()
+
+        jar = httpx.Cookies()
+        jar.set("SUB", "httpx-rotated", domain=".weibo.com", path="/")
+        store.replace_from_httpx(jar.jar)
+
+        accepted, revision = store.compare_and_merge_from_playwright(
+            stale_context_cookies,
+            expected_revision=context_revision,
+        )
+
+        self.assertFalse(accepted)
+        self.assertEqual(revision, store.revision)
+        self.assertEqual(store.cookie_dict()["SUB"], "httpx-rotated")
+
+    def test_stale_httpx_writer_cannot_overwrite_browser_rotation(self) -> None:
+        store = CookieStore(self.path)
+        store.bootstrap('{"SUB":"old"}')
+        request_revision, _ = store.snapshot()
+        stale_jar = store.to_httpx_cookies()
+
+        store.merge_from_playwright([{
+            "name": "SUB",
+            "value": "browser-rotated",
+            "domain": ".weibo.com",
+            "path": "/",
+        }])
+
+        accepted, revision = store.compare_and_replace_from_httpx(
+            stale_jar.jar,
+            expected_revision=request_revision,
+        )
+
+        self.assertFalse(accepted)
+        self.assertEqual(revision, store.revision)
+        self.assertEqual(store.cookie_dict()["SUB"], "browser-rotated")
+
+    def test_revision_survives_reload(self) -> None:
+        store = CookieStore(self.path)
+        store.bootstrap('{"SUB":"first"}')
+        original_revision = store.revision
+
+        reloaded = CookieStore(self.path)
+
+        self.assertEqual(reloaded.revision, original_revision)
+        self.assertEqual(reloaded.snapshot()[0], original_revision)
+
     def test_client_persists_rotation_and_updates_xsrf_header(self) -> None:
         store = CookieStore(self.path)
         store.bootstrap('{"XSRF-TOKEN":"old"}')
@@ -127,6 +177,33 @@ class CookieStoreTests(unittest.TestCase):
         self.assertEqual(seen_xsrf, ["old", "new"])
         self.assertEqual(mirror["XSRF-TOKEN"], "new")
         self.assertEqual(CookieStore(self.path).cookie_dict()["XSRF-TOKEN"], "new")
+
+    def test_client_adopts_browser_rotation_before_next_request(self) -> None:
+        store = CookieStore(self.path)
+        store.bootstrap('{"SUB":"old"}')
+        seen_cookie_headers = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen_cookie_headers.append(request.headers.get("cookie", ""))
+            return httpx.Response(200, json={"ok": 1})
+
+        mirror = store.cookie_dict()
+        with PersistentCookieClient(
+            store,
+            mirror,
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            store.merge_from_playwright([{
+                "name": "SUB",
+                "value": "browser-rotated",
+                "domain": ".weibo.com",
+                "path": "/",
+            }])
+            client.get("https://weibo.com/ajax/test")
+
+        self.assertEqual(seen_cookie_headers, ["SUB=browser-rotated"])
+        self.assertEqual(store.cookie_dict()["SUB"], "browser-rotated")
+        self.assertEqual(mirror["SUB"], "browser-rotated")
 
 
 if __name__ == "__main__":

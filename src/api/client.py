@@ -16,6 +16,14 @@ from src.api.cookie_store import CookieStore, parse_cookie_export
 from src.telegram.bot import _alert_tg
 from src.utils.LoggerManager import logger as log
 
+
+class WeiboApiError(RuntimeError):
+    """Structured upstream failure used by polling completeness checks."""
+
+    def __init__(self, kind: str):
+        super().__init__(kind)
+        self.kind = kind
+
 # ---------------------------------------------------------------------------
 # Cookie parsing
 # ---------------------------------------------------------------------------
@@ -74,13 +82,14 @@ class PersistentCookieClient(httpx.Client):
     ):
         self.cookie_store = store
         self.cookie_mirror = mirror
+        self._cookie_revision, initial_cookies = store.httpx_snapshot()
         super().__init__(
             headers={
                 "User-Agent": DESKTOP_UA,
                 "Referer": "https://weibo.com/",
                 "X-Requested-With": "XMLHttpRequest",
             },
-            cookies=store.to_httpx_cookies(),
+            cookies=initial_cookies,
             timeout=30,
             follow_redirects=True,
             transport=transport,
@@ -94,16 +103,34 @@ class PersistentCookieClient(httpx.Client):
         self.headers["X-XSRF-TOKEN"] = current.get("XSRF-TOKEN", "")
 
     def sync_from_store(self) -> None:
+        revision, cookies = self.cookie_store.httpx_snapshot()
         self.cookies.clear()
-        for cookie in self.cookie_store.to_httpx_cookies().jar:
+        for cookie in cookies.jar:
             self.cookies.jar.set_cookie(cookie)
+        self._cookie_revision = revision
         self._sync_views()
 
     def send(self, request, **kwargs):
+        if self.cookie_store.revision != self._cookie_revision:
+            self.sync_from_store()
+            request.headers.pop("cookie", None)
+            self.cookies.set_cookie_header(request)
+            request.headers["X-XSRF-TOKEN"] = self.cookie_mirror.get(
+                "XSRF-TOKEN", ""
+            )
         self._sync_views()
         response = super().send(request, **kwargs)
-        self.cookie_store.replace_from_httpx(self.cookies.jar)
-        self._sync_views()
+        accepted, revision = self.cookie_store.compare_and_replace_from_httpx(
+            self.cookies.jar,
+            expected_revision=self._cookie_revision,
+        )
+        if accepted:
+            self._cookie_revision = revision
+            self._sync_views()
+        else:
+            # A first-party browser context updated the store while this jar
+            # was based on an older snapshot. Never roll that rotation back.
+            self.sync_from_store()
         return response
 
 
@@ -125,9 +152,19 @@ def make_api_client(
 # Alert / response checking
 # ---------------------------------------------------------------------------
 
-def _check_response(r, uid: str, context: str = "API") -> Optional[Dict]:
+def _check_response(
+    r,
+    uid: str,
+    context: str = "API",
+    raise_errors: bool = False,
+) -> Optional[Dict]:
     """Check HTTP response for errors. Returns parsed JSON or None.
     Sends TG alerts for auth/rate/server errors."""
+
+    def fail(kind: str):
+        if raise_errors:
+            raise WeiboApiError(kind)
+        return None
 
     # HTTP status code checks
     status = r.status_code
@@ -140,7 +177,7 @@ def _check_response(r, uid: str, context: str = "API") -> Optional[Dict]:
                 f"UID: {uid}\n"
                 f"{context}: 被重定向到登录页\n\n"
                 f"请更新WEIBO_COOKIES")
-            return None
+            return fail("auth")
 
     if status == 403:
         log.error(f"[{context}] 403 Forbidden for {uid}")
@@ -149,7 +186,7 @@ def _check_response(r, uid: str, context: str = "API") -> Optional[Dict]:
             f"UID: {uid}\n"
             f"{context}: 请求被拒绝, 可能Cookie失效或IP被封\n\n"
             f"请检查WEIBO_COOKIES")
-        return None
+        return fail("auth")
 
     if status == 418:
         log.error(f"[{context}] 418 被风控 for {uid}")
@@ -158,7 +195,7 @@ def _check_response(r, uid: str, context: str = "API") -> Optional[Dict]:
             f"UID: {uid}\n"
             f"{context}: 请求频率过高或被识别为爬虫\n\n"
             f"监控将自动退避")
-        return None
+        return fail("rate_limit")
 
     if status == 429:
         log.error(f"[{context}] 429 Rate Limited for {uid}")
@@ -167,15 +204,15 @@ def _check_response(r, uid: str, context: str = "API") -> Optional[Dict]:
             f"UID: {uid}\n"
             f"{context}: 被限制请求频率\n\n"
             f"监控将自动退避")
-        return None
+        return fail("rate_limit")
 
     if status >= 500:
         log.error(f"[{context}] Server error {status} for {uid}")
-        return None
+        return fail("server_error")
 
     if status != 200:
         log.warning(f"[{context}] Unexpected status {status} for {uid}")
-        return None
+        return fail("unexpected_status")
 
     # Check if we were redirected to login (follow_redirects=True hides 302)
     final_url = str(r.url).lower()
@@ -186,7 +223,7 @@ def _check_response(r, uid: str, context: str = "API") -> Optional[Dict]:
             f"UID: {uid}\n"
             f"{context}: 被重定向到登录页\n\n"
             f"请更新WEIBO_COOKIES")
-        return None
+        return fail("auth")
 
     # Parse JSON
     try:
@@ -201,7 +238,7 @@ def _check_response(r, uid: str, context: str = "API") -> Optional[Dict]:
                 f"UID: {uid}\n"
                 f"{context}: 返回登录页面而非JSON\n\n"
                 f"请更新WEIBO_COOKIES")
-        return None
+        return fail("non_json")
 
     # Check ok field
     ok = data.get("ok", 0)
@@ -220,6 +257,6 @@ def _check_response(r, uid: str, context: str = "API") -> Optional[Dict]:
                 f"UID: {uid}\n"
                 f"{context}: {msg}\n\n"
                 f"监控将自动退避")
-        return None
+        return fail("api_error")
 
     return data

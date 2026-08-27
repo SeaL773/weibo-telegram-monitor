@@ -23,6 +23,25 @@ _pw_context = None
 _pw_page_count = 0
 _PW_MAX_PAGES = PW_CONTEXT_MAX_PAGES
 _cookie_store: Optional[CookieStore] = None
+_pw_context_revision: Optional[int] = None
+
+
+def _is_login_url(url: str) -> bool:
+    value = (url or "").lower()
+    return "passport.weibo" in value or "login.sina" in value
+
+
+def _discard_context() -> None:
+    """Close the current context without persisting unverified cookies."""
+    global _pw_context, _pw_page_count, _pw_context_revision
+    if _pw_context:
+        try:
+            _pw_context.close()
+        except Exception as exc:
+            log.debug(f"Discarding Playwright context: {exc}")
+    _pw_context = None
+    _pw_page_count = 0
+    _pw_context_revision = None
 
 
 def configure_cookie_store(store: CookieStore) -> None:
@@ -31,34 +50,49 @@ def configure_cookie_store(store: CookieStore) -> None:
     _cookie_store = store
 
 
-def _save_context_cookies() -> None:
+def _save_context_cookies() -> bool:
+    global _pw_context_revision
     if not _pw_context or not _cookie_store:
-        return
+        return True
     try:
-        _cookie_store.merge_from_playwright(_pw_context.cookies())
+        if _pw_context_revision is None:
+            _cookie_store.merge_from_playwright(_pw_context.cookies())
+            _pw_context_revision = _cookie_store.revision
+            return True
+
+        accepted, revision = _cookie_store.compare_and_merge_from_playwright(
+            _pw_context.cookies(),
+            expected_revision=_pw_context_revision,
+        )
+        if not accepted:
+            log.info(
+                "Skipped cookies from a stale Playwright context; "
+                "the context will be recreated from the current store"
+            )
+            return False
+        _pw_context_revision = revision
+        return True
     except Exception as e:
         log.warning(f"Failed to persist Playwright cookies: {e}")
+        return False
 
 
 def _get_browser(force_new=False):
     """Lazy-init Playwright browser. Recreate context periodically."""
-    global _pw, _pw_browser, _pw_context, _pw_page_count
+    global _pw, _pw_browser, _pw_context, _pw_page_count, _pw_context_revision
 
-    if _cookie_store:
-        pw_cookies = _cookie_store.playwright_cookies()
-    else:
-        _, pw_cookies = parse_cookies()
+    store_changed = bool(
+        _pw_context
+        and _cookie_store
+        and _pw_context_revision is not None
+        and _pw_context_revision != _cookie_store.revision
+    )
+    should_rotate = bool(
+        _pw_context
+        and (force_new or store_changed or _pw_page_count >= _PW_MAX_PAGES)
+    )
 
-    if force_new and _pw_context:
-        try:
-            _save_context_cookies()
-            _pw_context.close()
-        except Exception as e:
-            log.debug(f"Closing old Playwright context: {e}")
-        _pw_context = None
-        _pw_page_count = 0
-
-    if _pw_context and _pw_page_count < _PW_MAX_PAGES:
+    if _pw_context and not should_rotate:
         return _pw_context
 
     if _pw_context:
@@ -68,14 +102,25 @@ def _get_browser(force_new=False):
         except Exception as e:
             log.debug(f"Closing expired Playwright context: {e}")
         _pw_context = None
+        _pw_context_revision = None
+        _pw_page_count = 0
 
     if not _pw:
         _pw = sync_playwright().start()
     if not _pw_browser or not _pw_browser.is_connected():
         _pw_browser = _pw.chromium.launch(
             headless=True,
-            args=["--disable-gpu", "--disable-dev-shm-usage"],
+            args=["--disable-gpu"],
         )
+
+    # Read the snapshot only after the old context has saved its cookies.  A
+    # pre-close snapshot would immediately inject stale cookies into the new
+    # context after a successful rotation.
+    if _cookie_store:
+        context_revision, pw_cookies = _cookie_store.snapshot()
+    else:
+        context_revision = None
+        _, pw_cookies = parse_cookies()
 
     _pw_context = _pw_browser.new_context(
         viewport={"width": 1000, "height": 900},
@@ -87,6 +132,7 @@ def _get_browser(force_new=False):
     if pw_cookies:
         _pw_context.add_cookies(pw_cookies)
 
+    _pw_context_revision = context_revision
     _pw_page_count = 0
     log.info("Created new Playwright browser context")
     time.sleep(2)
@@ -95,7 +141,7 @@ def _get_browser(force_new=False):
 
 def cleanup_playwright():
     """Clean up Playwright resources. Called during shutdown."""
-    global _pw, _pw_browser, _pw_context
+    global _pw, _pw_browser, _pw_context, _pw_page_count, _pw_context_revision
     try:
         if _pw_context:
             _save_context_cookies()
@@ -107,12 +153,19 @@ def cleanup_playwright():
         log.info("Playwright cleaned up")
     except Exception as e:
         log.warning(f"Playwright cleanup error: {e}")
+    finally:
+        _pw_context = None
+        _pw_browser = None
+        _pw = None
+        _pw_page_count = 0
+        _pw_context_revision = None
 
 
 def refresh_weibo_session() -> bool:
     """Visit a first-party page so Weibo can rotate session cookies."""
     global _pw_page_count
     page = None
+    verified = False
     try:
         context = _get_browser()
         page = context.new_page()
@@ -123,13 +176,31 @@ def refresh_weibo_session() -> bool:
         )
         page.wait_for_timeout(5000)
         final_url = page.url.lower()
-        if "passport.weibo" in final_url or "login.sina" in final_url:
+        if _is_login_url(final_url):
             log.warning("Weibo session refresh reached a login page")
             return False
         if response and response.status >= 400:
             log.warning(f"Weibo session refresh returned HTTP {response.status}")
             return False
-        _save_context_cookies()
+        probe = context.request.get(
+            "https://weibo.com/ajax/config/getconfig",
+            timeout=30000,
+        )
+        if not probe.ok:
+            log.warning(f"Weibo auth probe returned HTTP {probe.status}")
+            return False
+        try:
+            probe_data = probe.json()
+        except Exception:
+            log.warning("Weibo auth probe returned a non-JSON response")
+            return False
+        config = probe_data.get("data", {}) if isinstance(probe_data, dict) else {}
+        if probe_data.get("ok") != 1 or config.get("login") is not True:
+            log.warning("Weibo auth probe did not confirm a logged-in session")
+            return False
+        if not _save_context_cookies():
+            return False
+        verified = True
         _pw_page_count += 1
         log.info("Weibo browser session refreshed")
         return True
@@ -142,7 +213,8 @@ def refresh_weibo_session() -> bool:
                 page.close()
             except Exception as e:
                 log.debug(f"Closing session refresh page: {e}")
-        _save_context_cookies()
+        if not verified:
+            _discard_context()
 
 
 def screenshot_post(mid: str, uid: str = "", _retry=0) -> Optional[io.BytesIO]:
@@ -159,6 +231,8 @@ def screenshot_post(mid: str, uid: str = "", _retry=0) -> Optional[io.BytesIO]:
         ctx = _get_browser()
         page = ctx.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        if _is_login_url(page.url):
+            raise RuntimeError("Weibo screenshot navigation reached a login page")
 
         # Wait for the post article to render
         try:
@@ -272,11 +346,14 @@ def screenshot_post(mid: str, uid: str = "", _retry=0) -> Optional[io.BytesIO]:
 
     except Exception as e:
         log.error(f"Screenshot failed for {mid}: {e}")
+        login_failure = page is not None and _is_login_url(page.url)
         if page:
             try:
                 page.close()
             except Exception as e:
                 log.debug(f"Closing page after screenshot error: {e}")
+        if login_failure:
+            _discard_context()
         if _retry < 2:
             log.info(f"Retrying screenshot for {mid} with fresh context (attempt {_retry + 2})...")
             time.sleep(3)

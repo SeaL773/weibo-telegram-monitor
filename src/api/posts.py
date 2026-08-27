@@ -2,19 +2,53 @@
 
 import random
 import time
-from typing import Dict, List, Optional
+from dataclasses import dataclass
+from typing import Collection, Dict, Generic, List, Optional, TypeVar
 
 import httpx
 
-from src.api.client import _check_response
+from src.api.client import WeiboApiError, _check_response
 from src.utils.LoggerManager import logger as log
 
 
-def fetch_user_posts(client: httpx.Client, uid: str, max_pages: int = 1) -> List[Dict]:
-    """Fetch user posts via desktop weibo.com API. Returns list of post dicts.
-    Use max_pages > 1 for initial archiving (fetch all history)."""
+T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class FetchResult(Generic[T]):
+    """Items fetched together with whether they form a complete snapshot.
+
+    ``complete=False`` means callers may inspect ``items`` for diagnostics or
+    best-effort processing, but must not use them to replace a stored snapshot.
+    ``truncated=True`` specifically means a configured page limit was reached.
+    """
+
+    items: List[T]
+    complete: bool
+    pages_fetched: int
+    reason: str
+    truncated: bool = False
+
+
+def fetch_user_posts(
+    client: httpx.Client,
+    uid: str,
+    max_pages: int = 1,
+    stop_ids: Optional[Collection[str]] = None,
+) -> FetchResult[Dict]:
+    """Fetch user posts via the desktop API with explicit completeness.
+
+    When ``stop_ids`` is provided, pagination is complete only after reaching
+    a previously seen post or an empty page. This prevents bursts larger than
+    one page from being silently skipped by a regular polling cycle.
+    """
+    if max_pages < 1:
+        raise ValueError("max_pages must be at least 1")
+
     url = "https://weibo.com/ajax/statuses/mymblog"
-    all_posts = []
+    all_posts: List[Dict] = []
+    pages_fetched = 0
+    high_watermarks = {str(item) for item in (stop_ids or []) if str(item)}
 
     for page in range(1, max_pages + 1):
         params = {"uid": uid, "page": page, "feature": 0}
@@ -22,22 +56,79 @@ def fetch_user_posts(client: httpx.Client, uid: str, max_pages: int = 1) -> List
             r = client.get(url, params=params)
         except Exception as e:
             log.error(f"API request failed for {uid} page {page}: {e}")
-            break
+            return FetchResult(
+                items=all_posts,
+                complete=False,
+                pages_fetched=pages_fetched,
+                reason="request_error",
+            )
 
-        data = _check_response(r, uid, context="mymblog")
-        if data is None:
-            break
+        try:
+            data = _check_response(
+                r,
+                uid,
+                context="mymblog",
+                raise_errors=True,
+            )
+        except WeiboApiError as exc:
+            return FetchResult(
+                items=all_posts,
+                complete=False,
+                pages_fetched=pages_fetched,
+                reason=exc.kind,
+            )
 
-        posts = data.get("data", {}).get("list", [])
+        payload = data.get("data")
+        if not isinstance(payload, dict) or not isinstance(payload.get("list"), list):
+            log.error(f"Malformed post list for {uid} page {page}")
+            return FetchResult(
+                items=all_posts,
+                complete=False,
+                pages_fetched=pages_fetched,
+                reason="invalid_payload",
+            )
+
+        posts = payload["list"]
+        pages_fetched += 1
         if not posts:
-            break
+            return FetchResult(
+                items=all_posts,
+                complete=True,
+                pages_fetched=pages_fetched,
+                reason="exhausted",
+            )
         all_posts.extend(posts)
         log.info(f"Fetched page {page} for {uid}: {len(posts)} posts (total: {len(all_posts)})")
 
-        if max_pages > 1 and page < max_pages:
+        if high_watermarks and any(
+            str(post.get("id", "") or post.get("mid", "")) in high_watermarks
+            for post in posts
+        ):
+            return FetchResult(
+                items=all_posts,
+                complete=True,
+                pages_fetched=pages_fetched,
+                reason="high_watermark",
+            )
+
+        if max_pages == 1 and stop_ids is None:
+            return FetchResult(
+                items=all_posts,
+                complete=True,
+                pages_fetched=pages_fetched,
+                reason="requested_window",
+            )
+
+        if page < max_pages:
             time.sleep(random.uniform(1, 2))
 
-    return all_posts
+    return FetchResult(
+        items=all_posts,
+        complete=False,
+        pages_fetched=pages_fetched,
+        reason="page_limit",
+        truncated=True,
+    )
 
 
 def extract_post_id(post: Dict) -> str:

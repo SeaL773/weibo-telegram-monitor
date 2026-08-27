@@ -7,10 +7,6 @@ from src.utils.LoggerManager import logger as log
 from pathlib import Path
 from typing import Optional
 
-from pyrogram import Client as PyroClient
-from pyrogram import enums as PyroEnums
-import pyrogram.utils
-
 from src.core.config import TG_API_ID, TG_API_HASH, TG_BOT_TOKEN, TG_CHAT_ID, DATA_DIR
 
 
@@ -18,19 +14,36 @@ from src.core.config import TG_API_ID, TG_API_HASH, TG_BOT_TOKEN, TG_CHAT_ID, DA
 # Pyrogram monkey-patch for peer_type
 # ---------------------------------------------------------------------------
 
-_orig_get_peer_type = pyrogram.utils.get_peer_type
+_pyro_enums = None
+_pyrogram_patched = False
 
 
-def _patched_get_peer_type(peer_id: int) -> str:
+def _load_pyrogram():
+    """Load the optional large-upload transport only when it is configured."""
+    global _pyro_enums, _pyrogram_patched
     try:
-        return _orig_get_peer_type(peer_id)
-    except ValueError:
-        if peer_id < 0:
-            return "chat"
-        raise
+        import pyrogram.utils
+        from pyrogram import Client as PyroClient
+        from pyrogram import enums as PyroEnums
+    except ImportError as exc:
+        log.error(f"Pyrogram is unavailable: {exc}")
+        return None
 
+    if not _pyrogram_patched:
+        original_get_peer_type = pyrogram.utils.get_peer_type
 
-pyrogram.utils.get_peer_type = _patched_get_peer_type
+        def patched_get_peer_type(peer_id: int) -> str:
+            try:
+                return original_get_peer_type(peer_id)
+            except ValueError:
+                if peer_id < 0:
+                    return "chat"
+                raise
+
+        pyrogram.utils.get_peer_type = patched_get_peer_type
+        _pyrogram_patched = True
+    _pyro_enums = PyroEnums
+    return PyroClient
 
 # ---------------------------------------------------------------------------
 # Pyrogram client
@@ -44,7 +57,10 @@ def get_pyro_client():
     if not TG_API_ID or not TG_API_HASH:
         return None
     if _pyro_client is None:
-        _pyro_client = PyroClient(
+        pyro_client_class = _load_pyrogram()
+        if pyro_client_class is None:
+            return None
+        _pyro_client = pyro_client_class(
             "weibo_telegram_monitor_bot",
             api_id=TG_API_ID,
             api_hash=TG_API_HASH,
@@ -101,6 +117,7 @@ def pyro_send_video(video_path: str, caption: str = "") -> bool:
     pyro = get_pyro_client()
     if not pyro:
         return False
+    loop = None
     try:
         loop = asyncio.new_event_loop()
 
@@ -117,7 +134,7 @@ def pyro_send_video(video_path: str, caption: str = "") -> bool:
                     "chat_id": chat_id,
                     "video": video_path,
                     "caption": caption,
-                    "parse_mode": PyroEnums.ParseMode.HTML,
+                    "parse_mode": _pyro_enums.ParseMode.HTML,
                     "supports_streaming": True,
                 }
                 if w and h:
@@ -130,9 +147,11 @@ def pyro_send_video(video_path: str, caption: str = "") -> bool:
                 await pyro.send_video(**kwargs)
 
         loop.run_until_complete(_send())
-        loop.close()
         log.info(f"[pyro] video sent: {Path(video_path).name}")
         return True
     except Exception as e:
         log.error(f"[pyro] send_video failed: {e}")
         return False
+    finally:
+        if loop is not None and not loop.is_closed():
+            loop.close()

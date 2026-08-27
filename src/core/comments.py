@@ -4,6 +4,7 @@ import random
 from src.utils.LoggerManager import logger as log
 import re
 import time
+from dataclasses import dataclass
 from typing import Dict
 
 import httpx
@@ -12,9 +13,17 @@ from src.core.config import COMMENT_MONITOR_HOURS
 from src.core.utils import html_escape
 from src.core.push import _clean_hashtag
 from src.api.client import _check_response
-from src.telegram.bot import tg_send_reply, tg_send_photo_url, tg_send_media_group_url
+from src.archive.outbox import DeliveryOutbox
 from src.archive.state import save_state
+from src.archive.storage import is_allowed_media_url
 
+
+
+@dataclass(frozen=True)
+class CommentPollResult:
+    activity: bool
+    complete: bool
+    state_changed: bool
 
 
 def _extract_comment_pic_urls(comment: dict) -> list:
@@ -60,15 +69,19 @@ def check_active_post_comments(
     mid: str,
     active_post: Dict,
     state: Dict,
-) -> bool:
+    outbox: DeliveryOutbox,
+) -> CommentPollResult:
     """Check comments and edits for a single active post.
-    Returns True if any new activity was found (to reset timer)."""
+    Returns activity and completeness without treating API failures as a poll."""
     uid = active_post["uid"]
     tg_message_id = active_post["tg_message_id"]
     username = state.get("profiles", {}).get(uid, {}).get("screen_name", uid)
     clean_name = _clean_hashtag(username)
     tag = f"#微博 #{clean_name}"
     activity_found = False
+    state_changed = False
+    comments_complete = False
+    edit_complete = False
 
     # --- 1. Check comments ---
     try:
@@ -85,6 +98,9 @@ def check_active_post_comments(
         data = _check_response(r, uid, context="buildComments")
         if data is not None:
             comments = data.get("data", [])
+            if not isinstance(comments, list):
+                raise ValueError("Malformed comments payload")
+            comments_complete = True
             seen_ids = set(active_post.get("seen_comment_ids", []))
             uid_int = int(uid)
 
@@ -128,16 +144,28 @@ def check_active_post_comments(
                     )
 
                 # Extract comment pictures
-                pic_urls = _extract_comment_pic_urls(comment)
+                pic_urls = [
+                    url
+                    for url in _extract_comment_pic_urls(comment)
+                    if is_allowed_media_url(url)
+                ]
                 if pic_urls:
-                    if len(pic_urls) == 1:
-                        tg_send_photo_url(pic_urls[0], caption=msg, reply_to=tg_message_id)
-                    else:
-                        tg_send_media_group_url(pic_urls, caption=msg, reply_to=tg_message_id)
+                    method = "photo" if len(pic_urls) == 1 else "media_group"
                 else:
-                    tg_send_reply(msg, tg_message_id)
+                    method = "reply"
+                outbox.enqueue(
+                    f"comment:{mid}:{cid}",
+                    "telegram",
+                    {
+                        "method": method,
+                        "text": msg,
+                        "reply_to": tg_message_id,
+                        "photo_urls": pic_urls,
+                    },
+                )
                 seen_ids.add(cid)
                 activity_found = True
+                state_changed = True
                 log.info(f"Pushed comment {cid} for post {mid}")
 
             active_post["seen_comment_ids"] = list(seen_ids)
@@ -150,21 +178,39 @@ def check_active_post_comments(
         r = api_client.get(url)
         data = _check_response(r, uid, context="statuses-show-edit-check")
         if data is not None:
+            edit_complete = True
             new_edit_count = data.get("edit_count", 0)
             stored_edit_count = active_post.get("edit_count", 0)
             if new_edit_count > stored_edit_count:
-                active_post["edit_count"] = new_edit_count
                 msg = f"{tag}\n编辑了微博内容"
-                tg_send_reply(msg, tg_message_id)
+                outbox.enqueue(
+                    f"edit:{mid}:{new_edit_count}",
+                    "telegram",
+                    {
+                        "method": "reply",
+                        "text": msg,
+                        "reply_to": tg_message_id,
+                    },
+                )
+                active_post["edit_count"] = new_edit_count
                 activity_found = True
+                state_changed = True
                 log.info(f"Post {mid} was edited (edit_count {stored_edit_count} → {new_edit_count})")
     except Exception as e:
         log.error(f"Failed to check post edit for {mid}: {e}")
 
-    return activity_found
+    return CommentPollResult(
+        activity=activity_found,
+        complete=comments_complete and edit_complete,
+        state_changed=state_changed,
+    )
 
 
-def poll_active_posts(api_client: httpx.Client, state: Dict):
+def poll_active_posts(
+    api_client: httpx.Client,
+    state: Dict,
+    outbox: DeliveryOutbox,
+):
     """Poll all active posts for comments/edits. Called once per main loop cycle."""
     active_posts = state.get("active_posts", {})
     if not active_posts:
@@ -173,6 +219,8 @@ def poll_active_posts(api_client: httpx.Client, state: Dict):
     now_ts = int(time.time())
     expired_mids = []
     polled = 0
+    failures = 0
+    state_dirty = False
 
     for mid, ap in list(active_posts.items()):
         # Check expiration
@@ -185,27 +233,35 @@ def poll_active_posts(api_client: httpx.Client, state: Dict):
             continue
 
         log.info(f"Polling comments for post {mid} (poll #{ap.get('poll_count', 0) + 1})")
-        activity = check_active_post_comments(api_client, mid, ap, state)
+        result = check_active_post_comments(api_client, mid, ap, state, outbox)
 
-        ap["poll_count"] = ap.get("poll_count", 0) + 1
-        ap["last_poll_time"] = now_ts
+        if result.complete:
+            ap["poll_count"] = ap.get("poll_count", 0) + 1
+            ap["last_poll_time"] = now_ts
+            state_dirty = True
+            polled += 1
+        else:
+            failures += 1
+            log.warning(f"Comment poll for post {mid} was incomplete; retrying later")
+        state_dirty = state_dirty or result.state_changed
 
-        if activity:
+        if result.activity:
             # Reset the 24h sliding window
             ap["last_activity"] = now_ts
             ap["expires_at"] = now_ts + COMMENT_MONITOR_HOURS * 3600
             log.info(f"Activity on post {mid}, reset expiry to {COMMENT_MONITOR_HOURS}h from now")
 
-        polled += 1
         # Small delay between API calls to avoid rate limiting
         time.sleep(random.uniform(2, 4))
 
     # Clean up expired posts
     for mid in expired_mids:
         del active_posts[mid]
+        state_dirty = True
         log.info(f"Post {mid} expired from comment monitoring")
 
-    if polled > 0 or expired_mids:
+    if state_dirty:
         save_state(state)
         if polled > 0:
             log.info(f"Polled {polled} active posts, {len(expired_mids)} expired, {len(active_posts)} remaining")
+    return failures

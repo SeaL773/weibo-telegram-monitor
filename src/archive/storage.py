@@ -3,6 +3,7 @@
 import io
 import json
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
@@ -23,6 +24,7 @@ from src.api.posts import extract_post_id, get_post_username, is_retweet
 from src.telegram.bot import tg_send_video_file
 from src.telegram.pyrogram import pyro_send_video
 from src.utils.LoggerManager import logger as log
+from src.archive.state import atomic_write_json
 
 # ---------------------------------------------------------------------------
 # Reusable media client
@@ -75,6 +77,13 @@ def get_media_client() -> httpx.Client:
             event_hooks={"request": [_validate_media_request]},
         )
     return _media_client
+
+
+def close_media_client() -> None:
+    global _media_client
+    if _media_client is not None and not _media_client.is_closed:
+        _media_client.close()
+    _media_client = None
 
 
 def archive_post(post: Dict, uid: str, screenshot_bytes: Optional[io.BytesIO] = None,
@@ -180,12 +189,28 @@ def archive_post(post: Dict, uid: str, screenshot_bytes: Optional[io.BytesIO] = 
     if json_path.exists():
         try:
             existing = json.loads(json_path.read_text(encoding="utf-8"))
+            if not isinstance(existing, list):
+                raise ValueError("archive root must be an array")
         except Exception as e:
-            log.debug(f"Failed to parse archive JSON {json_path}: {e}")
+            corrupt_path = json_path.with_name(
+                f"{json_path.name}.corrupt-{time.time_ns()}"
+            )
+            try:
+                json_path.replace(corrupt_path)
+                log.error(
+                    f"Invalid archive quarantined as {corrupt_path.name}: "
+                    f"{type(e).__name__}"
+                )
+            except OSError as quarantine_error:
+                log.error(
+                    f"Invalid archive could not be quarantined: "
+                    f"{type(quarantine_error).__name__}"
+                )
+                return
             existing = []
     if not any(e.get("id") == mid for e in existing):
         existing.append(entry)
-        json_path.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_json(json_path, existing)
         log.info(f"Archived post {mid} to {cat}.json")
 
 
@@ -214,10 +239,10 @@ def download_video(url: str, mid: str, cookie_dict: Dict) -> Optional[str]:
             total = 0
             with open(video_path, "wb") as f:
                 for chunk in r.iter_bytes(chunk_size=65536):
-                    f.write(chunk)
                     total += len(chunk)
                     if total > MAX_VIDEO_BYTES:
                         raise ValueError("Video exceeds MAX_VIDEO_BYTES")
+                    f.write(chunk)
         size_mb = total / (1024 * 1024)
         log.info(f"Video downloaded: {mid}.mp4 ({size_mb:.1f} MB)")
         return video_path
@@ -230,7 +255,7 @@ def download_video(url: str, mid: str, cookie_dict: Dict) -> Optional[str]:
         return None
 
 
-def send_video(video_path: str, caption: str):
+def send_video(video_path: str, caption: str) -> bool:
     """Send video via Pyrogram MTProto (>=50MB) or Bot API (<50MB)."""
     file_size = Path(video_path).stat().st_size
     size_mb = file_size / (1024 * 1024)
@@ -246,14 +271,24 @@ def send_video(video_path: str, caption: str):
         else:
             log.info(f"Sending video via Bot API ({size_mb:.1f} MB)...")
         result = tg_send_video_file(video_path, caption)
-        if not result:
+        sent = bool(result)
+        if not sent:
             log.warning(f"Failed to send video via Bot API: {video_path}")
 
-    # Cleanup
-    try:
-        Path(video_path).unlink()
-        thumb = video_path.rsplit(".", 1)[0] + "_thumb.jpg"
-        if Path(thumb).exists():
-            Path(thumb).unlink()
-    except Exception as e:
-        log.debug(f"Cleanup video/thumb files: {e}")
+    if sent:
+        try:
+            Path(video_path).unlink()
+            thumb = video_path.rsplit(".", 1)[0] + "_thumb.jpg"
+            if Path(thumb).exists():
+                Path(thumb).unlink()
+        except Exception as e:
+            log.debug(f"Cleanup video/thumb files: {e}")
+    else:
+        # Video delivery is best effort within the post event. Remove failed
+        # artifacts so a persistent Telegram outage cannot fill the data disk.
+        try:
+            Path(video_path).unlink(missing_ok=True)
+            Path(video_path.rsplit(".", 1)[0] + "_thumb.jpg").unlink(missing_ok=True)
+        except Exception as e:
+            log.debug(f"Cleanup failed video/thumb files: {e}")
+    return sent

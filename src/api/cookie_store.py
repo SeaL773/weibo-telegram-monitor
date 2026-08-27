@@ -104,6 +104,7 @@ class CookieStore:
         self.path = path
         self._lock = threading.RLock()
         self._cookies: Dict[tuple, CookieRecord] = {}
+        self._revision = 0
         self._load()
 
     @staticmethod
@@ -120,6 +121,11 @@ class CookieStore:
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             records = payload.get("cookies", []) if isinstance(payload, dict) else payload
+            if isinstance(payload, dict):
+                try:
+                    self._revision = max(0, int(payload.get("revision", 0)))
+                except (TypeError, ValueError):
+                    self._revision = 0
             for raw in records:
                 if isinstance(raw, Mapping):
                     cookie = _normalize_cookie(raw)
@@ -144,6 +150,17 @@ class CookieStore:
         with self._lock:
             return [dict(cookie) for cookie in self._cookies.values()]
 
+    @property
+    def revision(self) -> int:
+        """Return the current in-process revision of the cookie collection."""
+        with self._lock:
+            return self._revision
+
+    def snapshot(self) -> tuple[int, List[CookieRecord]]:
+        """Return an atomic ``(revision, cookies)`` snapshot."""
+        with self._lock:
+            return self._revision, [dict(cookie) for cookie in self._cookies.values()]
+
     def cookie_dict(self) -> Dict[str, str]:
         """Compatibility view for existing media download code."""
         with self._lock:
@@ -153,11 +170,16 @@ class CookieStore:
         return self.records()
 
     def to_httpx_cookies(self) -> httpx.Cookies:
+        _, cookies = self.httpx_snapshot()
+        return cookies
+
+    def httpx_snapshot(self) -> tuple[int, httpx.Cookies]:
+        """Return an atomic revision and httpx cookie jar snapshot."""
         cookies = httpx.Cookies()
         with self._lock:
             for record in self._cookies.values():
                 cookies.jar.set_cookie(self._to_cookiejar_cookie(record))
-        return cookies
+            return self._revision, cookies
 
     @staticmethod
     def _to_cookiejar_cookie(record: Mapping[str, Any]) -> Cookie:
@@ -209,12 +231,71 @@ class CookieStore:
     def replace_from_httpx(self, jar: CookieJar) -> bool:
         """Replace shared state with httpx's complete jar after each response."""
         records = [self._from_cookiejar(cookie) for cookie in jar]
-        return self._replace(records, "httpx response")
+        _, changed, _ = self._replace(records, "httpx response")
+        return changed
+
+    def compare_and_replace_from_httpx(
+        self,
+        jar: CookieJar,
+        expected_revision: int,
+    ) -> tuple[bool, int]:
+        """Replace from httpx only when ``expected_revision`` is current.
+
+        Returns ``(accepted, current_revision)``.  A rejected stale writer does
+        not modify any cookie.  This is provided for clients that retain the
+        revision associated with the jar used to build a request.
+        """
+        records = [self._from_cookiejar(cookie) for cookie in jar]
+        accepted, _, revision = self._replace(
+            records,
+            "httpx response",
+            expected_revision=expected_revision,
+        )
+        return accepted, revision
 
     def merge_from_playwright(self, records: Iterable[Mapping[str, Any]]) -> bool:
         """Merge cookies updated by first-party page navigation."""
+        _, changed, _ = self._merge(
+            records,
+            "Playwright navigation",
+        )
+        return changed
+
+    def compare_and_merge_from_playwright(
+        self,
+        records: Iterable[Mapping[str, Any]],
+        expected_revision: int,
+    ) -> tuple[bool, int]:
+        """Merge a Playwright snapshot if its base revision is still current.
+
+        Returns ``(accepted, current_revision)``.  Rejecting the whole stale
+        snapshot is intentional: without per-cookie source timestamps it is
+        not possible to distinguish a legitimate rotation from an old value.
+        """
+        accepted, _, revision = self._merge(
+            records,
+            "Playwright navigation",
+            expected_revision=expected_revision,
+        )
+        return accepted, revision
+
+    def _merge(
+        self,
+        records: Iterable[Mapping[str, Any]],
+        reason: str,
+        expected_revision: Optional[int] = None,
+    ) -> tuple[bool, bool, int]:
         changed = False
         with self._lock:
+            if (
+                expected_revision is not None
+                and expected_revision != self._revision
+            ):
+                log.info(
+                    f"Rejected stale cookie writer for {reason}: "
+                    f"expected revision {expected_revision}, current {self._revision}"
+                )
+                return False, False, self._revision
             for raw in records:
                 cookie = _normalize_cookie(raw)
                 if not cookie:
@@ -224,34 +305,51 @@ class CookieStore:
                     self._cookies[key] = cookie
                     changed = True
             if changed:
-                self._save_locked("Playwright navigation")
-        return changed
+                self._save_locked(reason)
+            return True, changed, self._revision
 
-    def _replace(self, records: Iterable[Mapping[str, Any]], reason: str) -> bool:
+    def _replace(
+        self,
+        records: Iterable[Mapping[str, Any]],
+        reason: str,
+        expected_revision: Optional[int] = None,
+    ) -> tuple[bool, bool, int]:
         normalized: Dict[tuple, CookieRecord] = {}
         for raw in records:
             cookie = _normalize_cookie(raw)
             if cookie:
                 normalized[self._key(cookie)] = cookie
         with self._lock:
+            if (
+                expected_revision is not None
+                and expected_revision != self._revision
+            ):
+                log.info(
+                    f"Rejected stale cookie writer for {reason}: "
+                    f"expected revision {expected_revision}, current {self._revision}"
+                )
+                return False, False, self._revision
             if normalized == self._cookies:
-                return False
+                return True, False, self._revision
             self._cookies = normalized
             self._save_locked(reason)
-            return True
+            return True, True, self._revision
 
     def _save_locked(self, reason: str) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._revision += 1
         payload = {
             "version": 1,
+            "revision": self._revision,
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "cookies": list(self._cookies.values()),
         }
         temp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-        temp_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        with temp_path.open("w", encoding="utf-8", newline="\n") as output:
+            json.dump(payload, output, ensure_ascii=False, indent=2)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
         try:
             os.chmod(temp_path, 0o600)
         except OSError as exc:

@@ -19,7 +19,11 @@ api_client = make_api_client(cookie_dict)
 uids = parse_targets()
 
 for uid in uids:
-    posts = fetch_user_posts(api_client, uid, max_pages=1)
+    fetch_result = fetch_user_posts(api_client, uid, max_pages=1)
+    if not fetch_result.complete:
+        print(f"Fetch failed for {uid}: {fetch_result.reason}")
+        continue
+    posts = fetch_result.items
     if posts:
         latest = posts[0]
         mid = extract_post_id(latest)

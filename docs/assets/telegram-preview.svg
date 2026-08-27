@@ -12,7 +12,7 @@
   <rect width="760" height="68" rx="22" fill="#242F3D"/>
   <rect y="45" width="760" height="23" fill="#242F3D"/>
   <circle cx="45" cy="34" r="18" fill="#E6162D"/>
-  <text x="77" y="31" fill="#FFF" font-family="Segoe UI,Arial,sans-serif" font-size="17" font-weight="700">Weibo Monitor</text>
+  <text x="77" y="31" fill="#FFF" font-family="Segoe UI,Arial,sans-serif" font-size="17" font-weight="700">Weibo Telegram Monitor</text>
   <text x="77" y="50" fill="#7F91A4" font-family="Segoe UI,Arial,sans-serif" font-size="12">bot</text>
   <g filter="url(#shadow)" font-family="Segoe UI,Arial,sans-serif">
     <rect x="42" y="94" width="596" height="294" rx="16" fill="#202B36"/>

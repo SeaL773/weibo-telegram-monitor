@@ -8,7 +8,7 @@
       </td>
     </tr>
   </table>
-  <h1>Unofficial Weibo → Telegram Monitor</h1>
+  <h1>weibo-telegram-monitor</h1>
   <p><strong>Durable public-post monitoring, persistent browser sessions, and private Telegram delivery.</strong></p>
   <p>
     <img src="https://img.shields.io/badge/python-3.11-blue?logo=python&logoColor=white" alt="Python 3.11">
@@ -20,12 +20,13 @@
 
 <img src="docs/assets/pipeline.svg" alt="Weibo to Telegram monitoring pipeline">
 
-This headless monitor polls Weibo's desktop Ajax API, captures mobile-layout
+This headless monitor polls Weibo's desktop Ajax API, captures desktop-layout
 screenshots with Playwright, and sends public-post updates to a private Telegram
-destination. A shared CookieStore synchronizes httpx and Playwright, persists
-normal server-side cookie rotation, and restores the session after container
-recreation. Post, comment, profile, and follow-list changes are tracked with
-bounded local media downloads and optional Pyrogram transport for large videos.
+destination. A revisioned CookieStore synchronizes httpx and Playwright without
+letting stale clients roll back rotated credentials. A durable SQLite outbox
+persists delivery intent before checkpoints advance. Post, comment, profile,
+and follow-list changes are tracked with bounded local media downloads and
+optional Pyrogram transport for large videos.
 
 > **Not affiliated with Weibo, Sina, Telegram, or any browser-extension provider.**
 > This independent client reads public pages that the configured account is
@@ -59,13 +60,13 @@ bounded local media downloads and optional Pyrogram transport for large videos.
 
 - **Post detection**: polls the desktop Ajax API with jitter, detects original
   posts and reposts, and maintains a bounded seen-ID history per target.
-- **Screenshot capture**: uses a mobile Playwright context for clean post
+- **Screenshot capture**: uses a desktop Playwright context for clean post
   screenshots while sharing the same persistent authentication state as httpx.
-- **Durable state**: stores seen IDs, profile/follow metadata, active comment
-  watches, screenshots, and accepted media under the bind-mounted `data/` tree.
+- **Durable state and delivery**: atomically stores monitoring checkpoints and
+  uses a SQLite outbox with idempotent event keys and bounded retry backoff.
 - **Cookie rotation**: imports a browser cookie export once, persists normal
-  `Set-Cookie` updates, refreshes `X-XSRF-TOKEN`, and periodically visits a
-  first-party Weibo page to retain browser-side rotation.
+  `Set-Cookie` updates, refreshes `X-XSRF-TOKEN`, rejects stale writers, and
+  commits browser cookies only after an authenticated first-party probe.
 - **Change tracking**: detects comments with pictures, profile edits, new
   follows, and unfollows in addition to new posts.
 - **Telegram delivery**: sends formatted text, photos, GIFs, screenshots, and
@@ -96,6 +97,7 @@ and available media returned by Weibo.
 | Target polling | Requests each configured UID from the desktop Ajax API with per-cycle jitter and failure isolation |
 | Cookie store | Shares allowlisted Weibo/Sina cookies between httpx and Playwright and persists rotation atomically |
 | Change detection | Compares posts, comments, profile fields, and follow lists with durable local state |
+| Delivery outbox | Commits notification intent before state advances and retries transient failures |
 | Playwright | Visits first-party pages for screenshots and periodic browser-session refresh |
 | Local archive | Saves JSON metadata, screenshots, and size-bounded media under `data/` |
 | Telegram | Delivers alerts through the Bot API and optionally uploads large video through Pyrogram |
@@ -104,10 +106,10 @@ and available media returned by Weibo.
 
 1. On the first boot, the monitor imports `WEIBO_COOKIES` or
    `WEIBO_COOKIES_FILE` into `data/auth_state.json`.
-2. Every httpx response can replace the shared jar with accepted `Set-Cookie`
-   rotation and update the current XSRF header.
+2. httpx and Playwright bind writes to a monotonic CookieStore revision; stale
+   writers are rejected instead of replacing a newer session.
 3. Playwright loads the shared records, periodically visits a first-party
-   Weibo page, and merges browser-side changes before context rotation.
+   Weibo page, verifies the authenticated state, and only then commits changes.
 4. Cookie updates are written through a temporary file and atomic replace;
    the persistent file becomes authoritative on later boots.
 
@@ -116,13 +118,14 @@ and available media returned by Weibo.
 - **Polling layer**: each target is checked independently, the interval includes
   jitter, and repeated outer-cycle failures use exponential backoff capped at
   one hour.
-- **Session layer**: httpx and Playwright use one CookieStore so rotation is not
-  lost between transports or container recreations.
+- **Session layer**: revision-based compare-and-swap prevents an old httpx jar
+  or Playwright context from rolling back newer cookie rotation.
 - **State layer**: seen IDs and change-tracking metadata are persisted during a
   cycle, while media downloads are streamed and capped rather than held fully
   in memory.
-- **Delivery layer**: text, screenshots, media, and large-video transport have
-  separate failure paths so an optional attachment does not stop later polls.
+- **Delivery layer**: SQLite persists an event before its monitoring checkpoint
+  advances. Failed events retry from 30 seconds up to a one-hour cap; optional
+  media failure never retries an already acknowledged primary notification.
 - **Liveness signal**: the monitor updates `/tmp/healthcheck`; Docker marks the
   container unhealthy when the heartbeat becomes stale.
 
@@ -159,7 +162,7 @@ docker compose logs -f --tail=100
 
 Docker Desktop users normally do not need the ownership command. The default
 `FIRST_RUN_MODE=archive` records existing post IDs without sending historical
-posts; it does not download every historical post. The initial cookie export is
+posts, up to a 50-page safety limit; it does not download every historical post. The initial cookie export is
 used only when persistent cookie state is empty.
 
 ## Configuration
@@ -185,8 +188,12 @@ All configuration is supplied through environment variables; see
 | `WEIBO_COOKIES` | first boot | `[]` | Initial browser cookie export as a JSON list or name/value object |
 | `WEIBO_COOKIES_FILE` | no | empty | File containing the initial cookie JSON; takes precedence over `WEIBO_COOKIES` |
 | `POLL_INTERVAL` | no | `300` | Base post-poll interval in seconds; the app adds up to 60 seconds of jitter in either direction |
+| `POLL_MAX_PAGES` | no | `10` | Regular-poll safety limit; checkpoints stop advancing if no known post is reached |
 | `FOLLOW_CHECK_INTERVAL` | no | `1800` | Follow-list check interval in seconds |
 | `COOKIE_REFRESH_INTERVAL` | no | `21600` | First-party browser-session refresh interval in seconds |
+| `HEALTH_TIMEOUT` | no | `1800` | Internal watchdog and container-health timeout in seconds |
+| `OUTBOX_BATCH_SIZE` | no | `20` | Due delivery events handled per pass (`1`–`200`) |
+| `OUTBOX_FILE` | no | `data/outbox.db` | SQLite outbox path inside the container |
 
 ### Telegram and media
 
@@ -203,12 +210,25 @@ do not append labels to the target list. The download client accepts HTTPS
 media only from an allowlist of Weibo/Sina CDN domains, validates redirects and
 content types, and enforces both declared and streamed size limits.
 
+`*_FILE` variables refer to paths inside the container, so mount those secret
+files read-only yourself. `TG_CHAT_ID` has no `_FILE` variant.
+
+Docker Compose resource limits are configurable through `MEM_LIMIT` (`2g`),
+`MEM_RESERVATION` (`512m`), and `CPU_LIMIT` (`2.0`). The default service also
+uses a read-only root filesystem, 512 MiB `/tmp` tmpfs, 512 MiB shared memory,
+a 256-process limit, a three-minute stop grace period, and local log rotation.
+
 ## Cookie and session lifecycle
 
 The browser export seeds `data/auth_state.json` only when that persistent file
 contains no usable cookies. From then on, the persistent CookieStore wins over
 the `.env` bootstrap value. This prevents an older environment export from
 overwriting newer server-side rotation after every restart.
+
+Cookie writes use a persistent monotonic revision. Both transports perform a
+compare-and-swap when saving; a context based on an older snapshot is discarded
+instead of rolling the session back. The browser refresh commits only after the
+Weibo configuration endpoint confirms that the session is logged in.
 
 Cookies are still provider-controlled credentials. Normal first-party activity
 can preserve rotations and reduce manual exports, but it cannot override an
@@ -245,11 +265,10 @@ weibo-telegram-monitor/
 ├── requirements.txt
 ├── .env.example
 ├── scripts/manual_push_test.py     # explicit opt-in live test
-├── test_cookie_store.py            # offline session tests
-├── test_security.py                # offline boundary tests
+├── test_*.py                       # offline reliability and security suite
 └── src/
     ├── api/                        # Weibo clients, parsing, CookieStore
-    ├── archive/                    # state and bounded media persistence
+    ├── archive/                    # atomic state, media, and SQLite outbox
     ├── core/                       # configuration, monitor loop, push logic
     ├── screenshot/                 # Playwright capture and session refresh
     ├── telegram/                   # Bot API and Pyrogram transports
@@ -266,9 +285,10 @@ ruff check .
 docker compose config
 ```
 
-Coverage includes environment bootstrap precedence, httpx and Playwright cookie
-rotation, cookie-domain filtering, URL redaction, media-host validation, and
-archive path boundaries. The manual push script sends a real Telegram message
+Coverage includes CookieStore concurrency, paginated-fetch completeness,
+atomic state persistence, outbox/delivery retry, Telegram multipart retry,
+cookie-domain filtering, media-host validation, and archive path boundaries.
+The manual push script sends a real Telegram message
 and requires an explicit opt-in; it is excluded from default test discovery.
 
 ```bash
@@ -277,7 +297,7 @@ RUN_LIVE_TESTS=1 python scripts/manual_push_test.py
 
 ## Security and privacy
 
-- **Treat `.env`, `data/auth_state.json`, Telegram/Pyrogram session files, and
+- **Treat `.env`, `data/auth_state.json`, `data/outbox.db`, Telegram/Pyrogram session files, and
   every Weibo or Telegram credential as secrets.** Do not paste them into
   issues, logs, screenshots, container images, or public backups.
 - `.env`, `data/`, sessions, logs, and caches are excluded from Git and the
@@ -287,17 +307,22 @@ RUN_LIVE_TESTS=1 python scripts/manual_push_test.py
   Windows bind mounts depend on Windows ACLs. Protect the host, backups, and
   disk, and keep the Telegram destination private.
 - Runtime data can include post/profile/follow metadata, comments, screenshots,
-  media, and message copies. Choose a retention period and delete unneeded data
+  media, and pending delivery payloads. Choose a retention period and delete unneeded data
   from `data/`, Docker logs, backups, and Telegram.
 - See [SECURITY.md](SECURITY.md) for private vulnerability reporting and
   [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for dependency and asset
   notices.
 
+Outbox payloads are erased after delivery while deduplication keys remain for
+30 days. Invalid state/archive JSON is quarantined with a `.corrupt-<timestamp>`
+suffix. Stop the container before backing up the entire `data/` directory so
+the SQLite database and any `-wal`/`-shm` sidecars stay together.
+
 ## Limitations
 
 - Weibo can expire or revoke a session despite periodic first-party refresh;
   account verification or a fresh browser export may still be required.
-- Desktop Ajax responses and mobile page DOM can change without notice and may
+- Desktop Ajax responses and desktop page DOM can change without notice and may
   require parser or screenshot-selector updates.
 - Playwright and Chromium consume substantially more memory and image size than
   an HTTP-only monitor.
@@ -313,7 +338,7 @@ RUN_LIVE_TESTS=1 python scripts/manual_push_test.py
 | No Telegram messages arrive | Incorrect bot token/chat ID, first-run archive mode, or no new posts | Startup logs; `TG_BOT_TOKEN`, `TG_CHAT_ID`, and `FIRST_RUN_MODE` |
 | Repeated Weibo auth failures | Incomplete/revoked cookies or an account challenge | Auth warnings, `data/auth_state.json`, and the session replacement flow |
 | Session works in a browser but expires in Docker | Container has stale bootstrap state or cannot persist rotation | `data/` ownership, CookieStore persistence logs, and `COOKIE_REFRESH_INTERVAL` |
-| Screenshots are blank or fail | Mobile DOM changed, Chromium failed, or the account cannot open the detail page | Playwright logs, container memory, and the target post URL |
+| Screenshots are blank or fail | Desktop DOM changed, Chromium failed, or the account cannot open the detail page | Playwright logs, container memory, and the target post URL |
 | Large video upload fails | Missing Telegram API credentials, FFmpeg failure, or media exceeds its cap | `TG_API_ID`, `TG_API_HASH`, Pyrogram logs, and `MAX_VIDEO_BYTES` |
 | Container becomes unhealthy | `/tmp/healthcheck` has not advanced within the healthcheck window | Monitor-cycle logs, upstream connectivity, and Docker health output |
 
