@@ -1,0 +1,30 @@
+services:
+  weibo-monitor:
+    build: .
+    container_name: weibo-monitor
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    environment:
+      - TZ=America/New_York
+      - HOME=/tmp
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    shm_size: "256m"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os,sys,time; sys.exit(0 if os.path.exists('/tmp/healthcheck') and time.time()-os.path.getmtime('/tmp/healthcheck')<900 else 1)\""]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"

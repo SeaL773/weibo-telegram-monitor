@@ -1,0 +1,15 @@
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = ["data"]
+
+[tool.ruff.lint]
+# Keep CI focused on correctness while the repository's existing style debt is
+# cleaned up incrementally.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/manual_push_test.py" = ["E402"] # Validates opt-in before importing the application.
+"test_security.py" = ["E402"] # Sets required environment variables before imports.
+"src/archive/state.py" = ["F401"] # Existing compatibility import.
+"src/core/config.py" = ["F401"] # Existing compatibility import.

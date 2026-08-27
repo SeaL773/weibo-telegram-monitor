@@ -1,0 +1,19 @@
+name: Security report redirect
+description: Do not disclose vulnerabilities or secrets in a public issue.
+title: "[Security] Request private reporting channel"
+labels:
+  - security
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not enter vulnerability details or live secrets here. Use the
+        repository Security tab to report a vulnerability privately. If that
+        option is unavailable, submit this form only to request a private
+        contact channel.
+  - type: checkboxes
+    attributes:
+      label: Confirmation
+      options:
+        - label: I have not included vulnerability details or live secrets.
+          required: true
