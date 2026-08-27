@@ -2,6 +2,12 @@
 
 This project depends on third-party software. Those components remain governed by their own licenses; the project's MIT License does not replace them.
 
+The Sina Weibo SVG under `docs/assets/` is sourced from Simple Icons 16.28.0,
+whose collection is distributed under CC0 1.0. Simple Icons does not grant
+trademark rights or clear third-party rights in individual marks. Sina Weibo
+and its logo remain trademarks of their respective owner; the icon is used only
+to identify interoperability and does not imply affiliation or endorsement.
+
 The direct Python dependencies declared in `requirements.txt` are summarized below. License names are based on upstream project metadata available when this notice was written:
 
 | Component | Declared version | Upstream license | Project |

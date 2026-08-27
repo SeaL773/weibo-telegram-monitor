@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 430" role="img">
+  <title>Fictional Telegram alert preview</title>
+  <defs>
+    <linearGradient id="photo" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#FECACA"/><stop offset=".5" stop-color="#FDE68A"/><stop offset="1" stop-color="#BFDBFE"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#000" flood-opacity=".2"/>
+    </filter>
+  </defs>
+  <rect width="760" height="430" rx="22" fill="#17212B"/>
+  <rect width="760" height="68" rx="22" fill="#242F3D"/>
+  <rect y="45" width="760" height="23" fill="#242F3D"/>
+  <circle cx="45" cy="34" r="18" fill="#E6162D"/>
+  <text x="77" y="31" fill="#FFF" font-family="Segoe UI,Arial,sans-serif" font-size="17" font-weight="700">Weibo Monitor</text>
+  <text x="77" y="50" fill="#7F91A4" font-family="Segoe UI,Arial,sans-serif" font-size="12">bot</text>
+  <g filter="url(#shadow)" font-family="Segoe UI,Arial,sans-serif">
+    <rect x="42" y="94" width="596" height="294" rx="16" fill="#202B36"/>
+    <text x="65" y="126" fill="#64B5EF" font-size="16" font-weight="700">Weibo Telegram Monitor</text>
+    <text x="65" y="158" fill="#E7EDF3" font-size="15" font-weight="700">#Weibo  #NewPost  #ExampleUser</text>
+    <text x="65" y="188" fill="#E7EDF3" font-size="15">A fictional public update used only for this preview.</text>
+    <text x="65" y="212" fill="#E7EDF3" font-size="15">Real alerts include the post link and available media.</text>
+    <rect x="65" y="236" width="550" height="104" rx="12" fill="url(#photo)"/>
+    <circle cx="142" cy="282" r="25" fill="#FFF" fill-opacity=".62"/>
+    <path d="M126 315c12-26 27-28 43 0" fill="#FFF" fill-opacity=".62"/>
+    <path d="M435 310 476 267l38 35 25-22 52 60H397Z" fill="#FFF" fill-opacity=".72"/>
+    <text x="553" y="371" fill="#7F91A4" font-size="12">12:34</text>
+  </g>
+</svg>

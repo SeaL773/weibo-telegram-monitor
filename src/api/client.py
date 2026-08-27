@@ -136,7 +136,7 @@ def _check_response(r, uid: str, context: str = "API") -> Optional[Dict]:
         if "login" in location.lower() or "passport" in location.lower():
             log.error(f"[{context}] Redirected to login for {uid}: {_safe_url(location)}")
             _alert_tg("cookie",
-                f"Weibo Monitor Cookie过期\n"
+                f"Weibo Telegram Monitor Cookie过期\n"
                 f"UID: {uid}\n"
                 f"{context}: 被重定向到登录页\n\n"
                 f"请更新WEIBO_COOKIES")
@@ -145,7 +145,7 @@ def _check_response(r, uid: str, context: str = "API") -> Optional[Dict]:
     if status == 403:
         log.error(f"[{context}] 403 Forbidden for {uid}")
         _alert_tg("cookie",
-            f"Weibo Monitor 403 Forbidden\n"
+            f"Weibo Telegram Monitor 403 Forbidden\n"
             f"UID: {uid}\n"
             f"{context}: 请求被拒绝, 可能Cookie失效或IP被封\n\n"
             f"请检查WEIBO_COOKIES")
@@ -154,7 +154,7 @@ def _check_response(r, uid: str, context: str = "API") -> Optional[Dict]:
     if status == 418:
         log.error(f"[{context}] 418 被风控 for {uid}")
         _alert_tg("rate",
-            f"Weibo Monitor 被风控 (418)\n"
+            f"Weibo Telegram Monitor 被风控 (418)\n"
             f"UID: {uid}\n"
             f"{context}: 请求频率过高或被识别为爬虫\n\n"
             f"监控将自动退避")
@@ -163,7 +163,7 @@ def _check_response(r, uid: str, context: str = "API") -> Optional[Dict]:
     if status == 429:
         log.error(f"[{context}] 429 Rate Limited for {uid}")
         _alert_tg("rate",
-            f"Weibo Monitor 请求限速 (429)\n"
+            f"Weibo Telegram Monitor 请求限速 (429)\n"
             f"UID: {uid}\n"
             f"{context}: 被限制请求频率\n\n"
             f"监控将自动退避")
@@ -182,7 +182,7 @@ def _check_response(r, uid: str, context: str = "API") -> Optional[Dict]:
     if "login.sina" in final_url or "passport.weibo" in final_url:
         log.error(f"[{context}] Redirected to login for {uid}: {_safe_url(r.url)}")
         _alert_tg("cookie",
-            f"⚠️ Weibo Monitor Cookie过期\n"
+            f"⚠️ Weibo Telegram Monitor Cookie过期\n"
             f"UID: {uid}\n"
             f"{context}: 被重定向到登录页\n\n"
             f"请更新WEIBO_COOKIES")
@@ -197,7 +197,7 @@ def _check_response(r, uid: str, context: str = "API") -> Optional[Dict]:
         text_lower = r.text.lower() if r.text else ""
         if "passport" in text_lower or "login" in text_lower or "login.sina" in final_url:
             _alert_tg("cookie",
-                f"⚠️ Weibo Monitor Cookie过期\n"
+                f"⚠️ Weibo Telegram Monitor Cookie过期\n"
                 f"UID: {uid}\n"
                 f"{context}: 返回登录页面而非JSON\n\n"
                 f"请更新WEIBO_COOKIES")
@@ -210,13 +210,13 @@ def _check_response(r, uid: str, context: str = "API") -> Optional[Dict]:
         log.warning(f"[{context}] API error for {uid}: ok={ok}, msg={msg}")
         if "请登录" in msg or "login" in msg.lower() or ok == -100:
             _alert_tg("cookie",
-                f"Weibo Monitor Cookie可能过期\n"
+                f"Weibo Telegram Monitor Cookie可能过期\n"
                 f"UID: {uid}\n"
                 f"{context}: {msg or f'ok={ok}'}\n\n"
                 f"请更新WEIBO_COOKIES")
         elif "频繁" in msg or "操作过快" in msg:
             _alert_tg("rate",
-                f"Weibo Monitor 操作频繁\n"
+                f"Weibo Telegram Monitor 操作频繁\n"
                 f"UID: {uid}\n"
                 f"{context}: {msg}\n\n"
                 f"监控将自动退避")

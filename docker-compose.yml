@@ -1,7 +1,7 @@
 services:
-  weibo-monitor:
+  weibo-telegram-monitor:
     build: .
-    container_name: weibo-monitor
+    container_name: weibo-telegram-monitor
     restart: unless-stopped
     init: true
     env_file: .env

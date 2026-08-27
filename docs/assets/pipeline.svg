@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 250" role="img">
+  <title>Weibo to Telegram monitoring pipeline</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1200" y2="250" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#17202B"/><stop offset="1" stop-color="#242D38"/>
+    </linearGradient>
+    <filter id="s" x="-15%" y="-20%" width="130%" height="150%">
+      <feDropShadow dx="0" dy="5" stdDeviation="6" flood-color="#000" flood-opacity=".22"/>
+    </filter>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0 0 9 4.5 0 9Z" fill="#94A3B8"/>
+    </marker>
+  </defs>
+  <rect width="1200" height="250" rx="22" fill="url(#bg)"/>
+  <text x="44" y="42" fill="#CBD5E1" font-family="Segoe UI,Arial,sans-serif" font-size="18" font-weight="600" letter-spacing="2">PUBLIC UPDATE PIPELINE</text>
+  <g fill="none" stroke="#94A3B8" stroke-width="4" marker-end="url(#arrow)">
+    <path d="M250 139H330"/><path d="M535 139H615"/><path d="M820 139H900"/>
+  </g>
+  <g filter="url(#s)" font-family="Segoe UI,Arial,sans-serif">
+    <g>
+      <rect x="44" y="77" width="206" height="124" rx="18" fill="#FFF"/>
+      <circle cx="87" cy="120" r="23" fill="#E6162D"/>
+      <path d="M76 123c2-11 18-16 26-7 8 9-2 21-14 20-10-1-15-6-12-13Zm18-17c9-4 16 1 15 9" fill="none" stroke="#FFF" stroke-width="4" stroke-linecap="round"/>
+      <text x="121" y="119" fill="#0F172A" font-size="22" font-weight="700">Weibo</text>
+      <text x="121" y="146" fill="#64748B" font-size="15">Ajax + public pages</text>
+      <text x="64" y="179" fill="#94A3B8" font-size="14">Conservative polling</text>
+    </g>
+    <g>
+      <rect x="330" y="77" width="205" height="124" rx="18" fill="#FFF"/>
+      <rect x="352" y="101" width="41" height="45" rx="8" fill="#CB2B36"/>
+      <circle cx="373" cy="123" r="7" fill="#FFF"/>
+      <text x="410" y="119" fill="#0F172A" font-size="20" font-weight="700">CookieStore</text>
+      <text x="410" y="146" fill="#64748B" font-size="15">httpx + Playwright</text>
+      <text x="351" y="179" fill="#94A3B8" font-size="14">Atomic session state</text>
+    </g>
+    <g>
+      <rect x="615" y="77" width="205" height="124" rx="18" fill="#FFF"/>
+      <path d="M644 137h43M650 119h31M657 101h17" stroke="#CB2B36" stroke-width="7" stroke-linecap="round"/>
+      <text x="703" y="119" fill="#0F172A" font-size="20" font-weight="700">Monitor</text>
+      <text x="703" y="146" fill="#64748B" font-size="15">Detect + capture</text>
+      <text x="637" y="179" fill="#94A3B8" font-size="14">Durable local archive</text>
+    </g>
+    <g>
+      <rect x="900" y="77" width="256" height="124" rx="18" fill="#FFF"/>
+      <circle cx="943" cy="123" r="25" fill="#229ED9"/>
+      <path d="m930 121 27-11-7 28-9-8-6 5 2-9Z" fill="#FFF"/>
+      <text x="982" y="119" fill="#0F172A" font-size="20" font-weight="700">Telegram</text>
+      <text x="982" y="146" fill="#64748B" font-size="15">Private destination</text>
+      <text x="922" y="179" fill="#94A3B8" font-size="14">Bot API + Pyrogram</text>
+    </g>
+  </g>
+</svg>

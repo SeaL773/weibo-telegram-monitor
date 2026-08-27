@@ -45,7 +45,7 @@ def get_pyro_client():
         return None
     if _pyro_client is None:
         _pyro_client = PyroClient(
-            "weibo_monitor_bot",
+            "weibo_telegram_monitor_bot",
             api_id=TG_API_ID,
             api_hash=TG_API_HASH,
             bot_token=TG_BOT_TOKEN,

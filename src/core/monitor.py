@@ -77,7 +77,7 @@ def main():
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    log.info("Starting Weibo Monitor")
+    log.info("Starting Weibo Telegram Monitor")
 
     target_uids = parse_targets()
     cookie_store = load_cookie_store()
@@ -274,19 +274,19 @@ def main():
             # Detect auth/cookie issues
             if any(k in err_str for k in ["401", "403", "unauthorized", "forbidden", "login"]):
                 _alert_tg("cookie",
-                    f"Weibo Monitor Cookie失效/被风控\n"
+                    f"Weibo Telegram Monitor Cookie失效/被风控\n"
                     f"Error: {html_escape(type(e).__name__)}\n"
                     f"连续失败: {_consecutive_failures}次\n\n"
                     f"请更新WEIBO_COOKIES")
             elif any(k in err_str for k in ["429", "418", "rate", "频繁"]):
                 _alert_tg("rate",
-                    f"Weibo Monitor 请求限速\n"
+                    f"Weibo Telegram Monitor 请求限速\n"
                     f"Error: {html_escape(type(e).__name__)}\n"
                     f"连续失败: {_consecutive_failures}次\n\n"
                     f"监控将自动退避")
             elif _consecutive_failures >= 3:
                 _alert_tg("error",
-                    f"Weibo Monitor 连续失败\n"
+                    f"Weibo Telegram Monitor 连续失败\n"
                     f"连续失败: {_consecutive_failures}次\n"
                     f"Error: {html_escape(str(e)[:200])}\n\n"
                     f"请检查监控状态")
@@ -321,4 +321,4 @@ def main():
             _tg_client.close()
     except Exception as e:
         log.debug(f"Closing TG client on shutdown: {e}")
-    log.info("Weibo Monitor stopped")
+    log.info("Weibo Telegram Monitor stopped")
