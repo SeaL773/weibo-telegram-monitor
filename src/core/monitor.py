@@ -192,7 +192,7 @@ def main():
 
                 if time.time() >= next_cookie_refresh:
                     _touch_heartbeat()
-                    refreshed = refresh_weibo_session()
+                    refreshed = refresh_weibo_session(target_uids[0] if target_uids else "")
                     api_client.sync_from_store()
                     refresh_jitter = min(max(COOKIE_REFRESH_INTERVAL // 6, 60), 3600)
                     if refreshed:
@@ -202,6 +202,7 @@ def main():
                             + random.randint(-refresh_jitter, refresh_jitter)
                         )
                     else:
+                        cycle_failures.append("cookie_refresh")
                         next_cookie_refresh = time.time() + min(
                             1800,
                             COOKIE_REFRESH_INTERVAL,

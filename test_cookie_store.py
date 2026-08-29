@@ -8,6 +8,7 @@ import types
 import unittest
 from datetime import timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 
@@ -21,7 +22,7 @@ if "pytz" not in sys.modules:
     except ImportError:
         sys.modules["pytz"] = types.SimpleNamespace(timezone=lambda _name: timezone.utc)
 
-from src.api.client import PersistentCookieClient  # noqa: E402
+from src.api.client import PersistentCookieClient, _check_response  # noqa: E402
 
 
 class CookieStoreTests(unittest.TestCase):
@@ -204,6 +205,49 @@ class CookieStoreTests(unittest.TestCase):
         self.assertEqual(seen_cookie_headers, ["SUB=browser-rotated"])
         self.assertEqual(store.cookie_dict()["SUB"], "browser-rotated")
         self.assertEqual(mirror["SUB"], "browser-rotated")
+
+    def test_code_minus_101_is_classified_as_auth_failure(self) -> None:
+        response = httpx.Response(
+            200,
+            json={"ok": 0, "code": "-101", "msg": "账号未登录"},
+            request=httpx.Request("GET", "https://weibo.com/ajax/test"),
+        )
+
+        with patch("src.api.client._alert_tg") as alert:
+            with self.assertRaisesRegex(RuntimeError, "auth"):
+                _check_response(response, "42", context="cookie-check", raise_errors=True)
+
+        alert.assert_called_once()
+        self.assertIn("code=-101", alert.call_args.args[1])
+
+    def test_nested_code_minus_101_is_classified_as_auth_failure(self) -> None:
+        response = httpx.Response(
+            200,
+            json={"ok": 1, "data": {"code": -101, "msg": "账号未登录"}},
+            request=httpx.Request("GET", "https://weibo.com/ajax/test"),
+        )
+
+        with patch("src.api.client._alert_tg") as alert:
+            with self.assertRaisesRegex(RuntimeError, "auth"):
+                _check_response(response, "42", context="cookie-check", raise_errors=True)
+
+        alert.assert_called_once()
+
+    def test_host_only_rotation_replaces_leading_dot_cookie(self) -> None:
+        store = CookieStore(self.path)
+        store.bootstrap(json.dumps([{
+            "name": "SUB",
+            "value": "old",
+            "domain": ".weibo.com",
+            "path": "/",
+        }]))
+        jar = httpx.Cookies()
+        jar.set("SUB", "new", domain="weibo.com", path="/")
+
+        store.replace_from_httpx(jar.jar)
+
+        self.assertEqual(store.cookie_dict(), {"SUB": "new"})
+        self.assertEqual(store.records()[0]["domain"], ".weibo.com")
 
 
 if __name__ == "__main__":

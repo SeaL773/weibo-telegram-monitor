@@ -240,10 +240,48 @@ def _check_response(
                 f"请更新WEIBO_COOKIES")
         return fail("non_json")
 
-    # Check ok field
-    ok = data.get("ok", 0)
+    # Weibo uses several response-code fields across desktop endpoints. Treat
+    # numeric strings the same as integers so auth failures are not downgraded
+    # to generic API errors (notably code=-101, "账号未登录").
+    def _as_int(value):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    ok = _as_int(data.get("ok", 0))
+    code = _as_int(data.get("code"))
+    retcode = _as_int(data.get("retcode"))
+    nested = data.get("data") if isinstance(data.get("data"), dict) else {}
+    nested_code = _as_int(nested.get("code"))
+    nested_retcode = _as_int(nested.get("retcode"))
+    msg = (
+        data.get("msg", "")
+        or data.get("message", "")
+        or nested.get("msg", "")
+        or nested.get("message", "")
+    )
+    msg = str(msg)
+    auth_codes = {-100, -101}
+    candidates = (code, retcode, nested_code, nested_retcode, ok)
+    if any(candidate in auth_codes for candidate in candidates):
+        auth_code = next(
+            candidate for candidate in candidates if candidate in auth_codes
+        )
+        log.warning(
+            f"[{context}] Authentication failure for {uid}: "
+            f"code={auth_code}, msg={msg[:120]}"
+        )
+        _alert_tg(
+            "cookie",
+            "Weibo Telegram Monitor Cookie检查失败\n"
+            f"UID: {uid}\n"
+            f"{context}: code={auth_code} msg={msg[:120]}\n\n"
+            "请更新WEIBO_COOKIES",
+        )
+        return fail("auth")
+
     if ok != 1:
-        msg = data.get("msg", "") or data.get("message", "")
         log.warning(f"[{context}] API error for {uid}: ok={ok}, msg={msg}")
         if "请登录" in msg or "login" in msg.lower() or ok == -100:
             _alert_tg("cookie",

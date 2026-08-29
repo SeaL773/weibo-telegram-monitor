@@ -52,10 +52,13 @@ def _normalize_cookie(raw: Mapping[str, Any]) -> Optional[CookieRecord]:
     except (TypeError, ValueError):
         expires = None
 
+    domain = str(raw.get("domain") or ".weibo.com")
+    if domain.lower() == "weibo.com":
+        domain = ".weibo.com"
     record: CookieRecord = {
         "name": name,
         "value": value,
-        "domain": str(raw.get("domain") or ".weibo.com"),
+        "domain": domain,
         "path": str(raw.get("path") or "/"),
         "secure": bool(raw.get("secure", True)),
         "httpOnly": bool(raw.get("httpOnly", raw.get("httponly", False))),
@@ -111,7 +114,9 @@ class CookieStore:
     def _key(cookie: Mapping[str, Any]) -> tuple:
         return (
             str(cookie.get("name", "")),
-            str(cookie.get("domain", ".weibo.com")).lower(),
+            # Treat host-only and leading-dot forms for the same host as one
+            # logical credential. Weibo occasionally omits Domain on rotation.
+            str(cookie.get("domain", ".weibo.com")).lstrip(".").lower(),
             str(cookie.get("path", "/")),
         )
 
@@ -273,6 +278,19 @@ class CookieStore:
         not possible to distinguish a legitimate rotation from an old value.
         """
         accepted, _, revision = self._merge(
+            records,
+            "Playwright navigation",
+            expected_revision=expected_revision,
+        )
+        return accepted, revision
+
+    def compare_and_replace_from_playwright(
+        self,
+        records: Iterable[Mapping[str, Any]],
+        expected_revision: int,
+    ) -> tuple[bool, int]:
+        """Replace the shared jar with a complete verified browser snapshot."""
+        accepted, _, revision = self._replace(
             records,
             "Playwright navigation",
             expected_revision=expected_revision,

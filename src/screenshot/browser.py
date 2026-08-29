@@ -7,10 +7,11 @@ from typing import Optional
 
 from playwright.sync_api import sync_playwright
 
-from src.core.config import PW_CONTEXT_MAX_PAGES
+from src.core.config import DESKTOP_UA, PW_CONTEXT_MAX_PAGES
 from src.core.utils import mid_to_base62
 from src.api.client import parse_cookies
 from src.api.cookie_store import CookieStore
+from src.telegram.bot import _alert_tg
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +61,7 @@ def _save_context_cookies() -> bool:
             _pw_context_revision = _cookie_store.revision
             return True
 
-        accepted, revision = _cookie_store.compare_and_merge_from_playwright(
+        accepted, revision = _cookie_store.compare_and_replace_from_playwright(
             _pw_context.cookies(),
             expected_revision=_pw_context_revision,
         )
@@ -126,6 +127,7 @@ def _get_browser(force_new=False):
         viewport={"width": 1000, "height": 900},
         device_scale_factor=2,
         locale="zh-CN",
+        user_agent=DESKTOP_UA,
     )
 
     # Inject cookies
@@ -161,7 +163,7 @@ def cleanup_playwright():
         _pw_context_revision = None
 
 
-def refresh_weibo_session() -> bool:
+def refresh_weibo_session(uid: str = "") -> bool:
     """Visit a first-party page so Weibo can rotate session cookies."""
     global _pw_page_count
     page = None
@@ -183,7 +185,13 @@ def refresh_weibo_session() -> bool:
             log.warning(f"Weibo session refresh returned HTTP {response.status}")
             return False
         probe = context.request.get(
-            "https://weibo.com/ajax/config/getconfig",
+            "https://weibo.com/ajax/statuses/mymblog",
+            params={"uid": uid, "page": 1, "feature": 0} if uid else None,
+            headers={
+                "User-Agent": DESKTOP_UA,
+                "Referer": "https://weibo.com/",
+                "X-Requested-With": "XMLHttpRequest",
+            },
             timeout=30000,
         )
         if not probe.ok:
@@ -194,8 +202,40 @@ def refresh_weibo_session() -> bool:
         except Exception:
             log.warning("Weibo auth probe returned a non-JSON response")
             return False
-        config = probe_data.get("data", {}) if isinstance(probe_data, dict) else {}
-        if probe_data.get("ok") != 1 or config.get("login") is not True:
+        if not isinstance(probe_data, dict):
+            code = ""
+            raw_msg = "invalid_payload"
+            probe_ok = False
+        else:
+            code = probe_data.get("code", probe_data.get("retcode", ""))
+            raw_msg = probe_data.get("msg", probe_data.get("message", "账号未登录"))
+            try:
+                probe_ok = int(probe_data.get("ok", 0)) == 1
+            except (TypeError, ValueError):
+                probe_ok = False
+        nested = probe_data.get("data") if isinstance(probe_data, dict) else {}
+        nested = nested if isinstance(nested, dict) else {}
+        try:
+            probe_code = int(
+                probe_data.get("code", probe_data.get("retcode", nested.get("code", 0)))
+            )
+        except (TypeError, ValueError):
+            probe_code = 0
+        try:
+            nested_code = int(nested.get("code", nested.get("retcode", 0)))
+        except (TypeError, ValueError):
+            nested_code = 0
+        auth_failure = probe_code in {-100, -101} or nested_code in {-100, -101}
+        if auth_failure or not probe_ok:
+            msg = str(
+                raw_msg
+            )[:120]
+            if auth_failure:
+                _alert_tg(
+                    "cookie",
+                    "Weibo Telegram Monitor Cookie检查失败\n"
+                    f"code={code} msg={msg}\n\n请更新WEIBO_COOKIES",
+                )
             log.warning("Weibo auth probe did not confirm a logged-in session")
             return False
         if not _save_context_cookies():
