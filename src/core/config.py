@@ -92,6 +92,7 @@ DATA_DIR = Path("data")
 STATE_FILE = DATA_DIR / "state.json"
 COOKIE_STATE_FILE = DATA_DIR / "auth_state.json"
 OUTBOX_FILE = Path(os.environ.get("OUTBOX_FILE", str(DATA_DIR / "outbox.db")))
+BROWSER_PROFILE_DIR = DATA_DIR / "browser-profile"
 VIDEOS_DIR = DATA_DIR / "videos"
 ARCHIVE_DIR = DATA_DIR / "archive"
 
