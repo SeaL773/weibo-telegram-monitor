@@ -7,7 +7,7 @@ from typing import Optional
 
 from playwright.sync_api import sync_playwright
 
-from src.core.config import DESKTOP_UA, PW_CONTEXT_MAX_PAGES
+from src.core.config import BROWSER_PROFILE_DIR, DESKTOP_UA, PW_CONTEXT_MAX_PAGES
 from src.core.utils import mid_to_base62
 from src.api.client import parse_cookies
 from src.api.cookie_store import CookieStore
@@ -68,9 +68,14 @@ def _save_context_cookies() -> bool:
         if not accepted:
             log.info(
                 "Skipped cookies from a stale Playwright context; "
-                "the context will be recreated from the current store"
+                "the persistent context will be synchronized from the store"
             )
-            return False
+            revision, cookies = _cookie_store.snapshot()
+            _pw_context.clear_cookies()
+            if cookies:
+                _pw_context.add_cookies(cookies)
+            _pw_context_revision = revision
+            return True
         _pw_context_revision = revision
         return True
     except Exception as e:
@@ -88,12 +93,18 @@ def _get_browser(force_new=False):
         and _pw_context_revision is not None
         and _pw_context_revision != _cookie_store.revision
     )
-    should_rotate = bool(
-        _pw_context
-        and (force_new or store_changed or _pw_page_count >= _PW_MAX_PAGES)
-    )
+    # Keep one persistent context alive. Apply httpx rotations in place rather
+    # than restarting Chromium and losing in-memory browser activity.
+    should_rotate = bool(_pw_context and force_new)
 
     if _pw_context and not should_rotate:
+        if store_changed and _cookie_store:
+            revision, cookies = _cookie_store.snapshot()
+            _pw_context.clear_cookies()
+            if cookies:
+                _pw_context.add_cookies(cookies)
+            _pw_context_revision = revision
+            log.info("Synchronized persistent browser cookies from CookieStore")
         return _pw_context
 
     if _pw_context:
@@ -108,7 +119,7 @@ def _get_browser(force_new=False):
 
     if not _pw:
         _pw = sync_playwright().start()
-    if not _pw_browser or not _pw_browser.is_connected():
+    if _pw_browser is not None and not _pw_browser.is_connected():
         _pw_browser = _pw.chromium.launch(
             headless=True,
             args=["--disable-gpu"],
@@ -123,20 +134,39 @@ def _get_browser(force_new=False):
         context_revision = None
         _, pw_cookies = parse_cookies()
 
-    _pw_context = _pw_browser.new_context(
-        viewport={"width": 1000, "height": 900},
-        device_scale_factor=2,
-        locale="zh-CN",
-        user_agent=DESKTOP_UA,
-    )
-
-    # Inject cookies
-    if pw_cookies:
-        _pw_context.add_cookies(pw_cookies)
+    if _pw_browser is None:
+        BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        _pw_context = _pw.chromium.launch_persistent_context(
+            str(BROWSER_PROFILE_DIR),
+            headless=True,
+            viewport={"width": 1000, "height": 900},
+            device_scale_factor=2,
+            locale="zh-CN",
+            user_agent=DESKTOP_UA,
+            timezone_id="America/New_York",
+            args=["--disable-gpu"],
+        )
+        # CookieStore is authoritative for the HTTP client. Clear only the
+        # dedicated profile's cookies so a stale profile cannot resurrect an
+        # expired session; localStorage/IndexedDB remain persistent.
+        _pw_context.clear_cookies()
+        if pw_cookies:
+            _pw_context.add_cookies(pw_cookies)
+        log.info("Created persistent Playwright browser profile")
+    else:
+        _pw_context = _pw_browser.new_context(
+            viewport={"width": 1000, "height": 900},
+            device_scale_factor=2,
+            locale="zh-CN",
+            user_agent=DESKTOP_UA,
+        )
+        if pw_cookies:
+            _pw_context.add_cookies(pw_cookies)
 
     _pw_context_revision = context_revision
     _pw_page_count = 0
-    log.info("Created new Playwright browser context")
+    if _pw_browser is not None:
+        log.info("Created new Playwright browser context")
     time.sleep(2)
     return _pw_context
 
@@ -167,7 +197,7 @@ def refresh_weibo_session(uid: str = "") -> bool:
     """Visit a first-party page so Weibo can rotate session cookies."""
     global _pw_page_count
     page = None
-    verified = False
+    auth_failed = False
     try:
         context = _get_browser()
         page = context.new_page()
@@ -179,6 +209,7 @@ def refresh_weibo_session(uid: str = "") -> bool:
         page.wait_for_timeout(5000)
         final_url = page.url.lower()
         if _is_login_url(final_url):
+            auth_failed = True
             log.warning("Weibo session refresh reached a login page")
             return False
         if response and response.status >= 400:
@@ -227,6 +258,7 @@ def refresh_weibo_session(uid: str = "") -> bool:
             nested_code = 0
         auth_failure = probe_code in {-100, -101} or nested_code in {-100, -101}
         if auth_failure or not probe_ok:
+            auth_failed = auth_failure
             msg = str(
                 raw_msg
             )[:120]
@@ -240,7 +272,6 @@ def refresh_weibo_session(uid: str = "") -> bool:
             return False
         if not _save_context_cookies():
             return False
-        verified = True
         _pw_page_count += 1
         log.info("Weibo browser session refreshed")
         return True
@@ -253,7 +284,7 @@ def refresh_weibo_session(uid: str = "") -> bool:
                 page.close()
             except Exception as e:
                 log.debug(f"Closing session refresh page: {e}")
-        if not verified:
+        if auth_failed:
             _discard_context()
 
 

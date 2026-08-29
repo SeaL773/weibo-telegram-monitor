@@ -49,6 +49,9 @@ class FakeContext:
         self.added_cookies = [dict(cookie) for cookie in cookies]
         self._cookies = [dict(cookie) for cookie in cookies]
 
+    def clear_cookies(self):
+        self._cookies = []
+
     def close(self):
         self.closed = True
 
@@ -106,7 +109,7 @@ class BrowserCookieCoordinationTests(unittest.TestCase):
         browser._pw_page_count = browser._PW_MAX_PAGES
 
         with patch.object(browser.time, "sleep", return_value=None):
-            new_context = browser._get_browser()
+            new_context = browser._get_browser(force_new=True)
 
         self.assertTrue(old_context.closed)
         self.assertEqual(self.store.cookie_dict()["SUB"], "browser-rotated")
@@ -116,7 +119,7 @@ class BrowserCookieCoordinationTests(unittest.TestCase):
         )
         self.assertEqual(browser._pw_context_revision, self.store.revision)
 
-    def test_stale_context_is_rejected_and_recreated_from_newer_store(self):
+    def test_stale_context_is_synchronized_from_newer_store(self):
         context_revision = self.store.revision
         old_context = FakeContext([self._cookie("old")])
         browser._pw_context = old_context
@@ -129,13 +132,35 @@ class BrowserCookieCoordinationTests(unittest.TestCase):
         with patch.object(browser.time, "sleep", return_value=None):
             new_context = browser._get_browser()
 
-        self.assertTrue(old_context.closed)
+        self.assertFalse(old_context.closed)
+        self.assertIs(new_context, old_context)
         self.assertEqual(self.store.cookie_dict()["SUB"], "httpx-rotated")
         self.assertEqual(
             new_context.added_cookies[0]["value"],
             "httpx-rotated",
         )
         self.assertEqual(browser._pw_context_revision, self.store.revision)
+
+    def test_page_limit_does_not_rotate_persistent_lifecycle(self):
+        context = FakeContext([self._cookie("old")])
+        browser._pw_context = context
+        browser._pw_context_revision = self.store.revision
+        browser._pw_page_count = browser._PW_MAX_PAGES
+
+        self.assertIs(browser._get_browser(), context)
+        self.assertFalse(context.closed)
+
+    def test_stale_save_resynchronizes_without_closing_context(self):
+        context = FakeContext([self._cookie("old")])
+        browser._pw_context = context
+        browser._pw_context_revision = self.store.revision
+        jar = httpx.Cookies()
+        jar.set("SUB", "httpx-new", domain=".weibo.com", path="/")
+        self.store.replace_from_httpx(jar.jar)
+
+        self.assertTrue(browser._save_context_cookies())
+        self.assertFalse(context.closed)
+        self.assertEqual(context.cookies()[0]["value"], "httpx-new")
 
 
 if __name__ == "__main__":
