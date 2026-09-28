@@ -1,5 +1,5 @@
 httpx==0.28.1
-pytz==2026.1.post1
+pytz==2026.4
 pyrogram==2.0.106
 tgcrypto==1.2.5
 playwright==1.58.0
